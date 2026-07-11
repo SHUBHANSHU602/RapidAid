@@ -1,0 +1,380 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.5">
+  <title>AI Urban Heat · ISRO</title>
+  <!-- Font & icons -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; font-family: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
+
+    body {
+      background: #0b0e17;
+      color: #eef2f6;
+      display: flex;
+      min-height: 100vh;
+      padding: 12px;
+      gap: 12px;
+      background-image: radial-gradient(circle at 20% 30%, rgba(59, 130, 246, 0.08) 0%, transparent 30%);
+    }
+
+    /* scrollbar */
+    ::-webkit-scrollbar { width: 4px; }
+    ::-webkit-scrollbar-track { background: #1a1f2b; border-radius: 8px; }
+    ::-webkit-scrollbar-thumb { background: #3b82f6; border-radius: 8px; }
+
+    /* glassmorphism base */
+    .glass {
+      background: rgba(18, 25, 40, 0.55);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      border: 1px solid rgba(59, 130, 246, 0.15);
+      border-radius: 24px;
+      box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5), 0 0 0 1px rgba(59, 130, 246, 0.05);
+      transition: all 0.2s ease;
+    }
+    .glass:hover { border-color: rgba(6, 182, 212, 0.25); box-shadow: 0 16px 48px rgba(0, 0, 0, 0.7), 0 0 0 1px rgba(6, 182, 212, 0.1); }
+
+    /* sidebar */
+    .sidebar {
+      width: 72px;
+      min-width: 72px;
+      background: rgba(12, 18, 30, 0.7);
+      backdrop-filter: blur(16px);
+      border-radius: 32px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 24px 0;
+      gap: 32px;
+      border: 1px solid rgba(59, 130, 246, 0.12);
+    }
+    .sidebar i { font-size: 22px; color: #8b9bb8; transition: 0.2s; cursor: default; }
+    .sidebar i:hover { color: #3b82f6; text-shadow: 0 0 12px #3b82f680; }
+    .sidebar .active i { color: #06b6d4; text-shadow: 0 0 16px #06b6d480; }
+
+    /* main wrapper */
+    .main-wrapper {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      overflow-x: hidden;
+    }
+
+    /* navbar */
+    .navbar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 10px 28px;
+      background: rgba(12, 18, 30, 0.5);
+      backdrop-filter: blur(12px);
+      border-radius: 40px;
+      border: 1px solid rgba(59, 130, 246, 0.08);
+      flex-wrap: wrap;
+      gap: 12px;
+    }
+    .navbar .brand { font-weight: 600; font-size: 18px; letter-spacing: -0.3px; background: linear-gradient(135deg, #3b82f6, #06b6d4); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+    .navbar .right-group { display: flex; align-items: center; gap: 24px; flex-wrap: wrap; }
+    .navbar .city-dropdown { background: rgba(255,255,255,0.04); border: 1px solid #2a3450; border-radius: 40px; padding: 6px 16px; font-size: 14px; color: #d1d9e8; }
+    .navbar .search { background: rgba(255,255,255,0.04); border: 1px solid #2a3450; border-radius: 40px; padding: 6px 16px; display: flex; align-items: center; gap: 8px; }
+    .navbar .search i { color: #6a7b96; }
+    .navbar .search input { background: transparent; border: none; color: #eef2f6; outline: none; width: 140px; }
+    .navbar .avatar { width: 36px; height: 36px; border-radius: 40px; background: linear-gradient(135deg, #3b82f6, #06b6d4); display: flex; align-items: center; justify-content: center; font-weight: 600; }
+
+    /* dashboard grid */
+    .dashboard-grid {
+      display: grid;
+      grid-template-columns: 1fr 1.2fr 0.9fr;
+      gap: 14px;
+      margin-top: 6px;
+    }
+
+    /* stat cards */
+    .stats-row {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 14px;
+      margin-bottom: 14px;
+    }
+    .stat-card {
+      padding: 18px 20px;
+      background: rgba(18, 25, 40, 0.4);
+      backdrop-filter: blur(8px);
+      border-radius: 24px;
+      border: 1px solid rgba(59, 130, 246, 0.08);
+      transition: 0.25s;
+    }
+    .stat-card:hover { border-color: #3b82f680; transform: translateY(-2px); }
+    .stat-card .label { font-size: 13px; color: #9aabc8; letter-spacing: 0.3px; }
+    .stat-card .value { font-size: 28px; font-weight: 600; margin: 6px 0 2px; letter-spacing: -0.5px; }
+    .stat-card .sub { font-size: 13px; color: #7e90b0; }
+
+    /* map */
+    .map-container {
+      grid-row: span 2;
+      height: 340px;
+      background: radial-gradient(circle at 20% 30%, #0d1b2a, #070b12);
+      border-radius: 28px;
+      padding: 16px;
+      position: relative;
+      border: 1px solid #1d2a40;
+      overflow: hidden;
+    }
+    .map-gradient {
+      width: 100%; height: 100%;
+      background: linear-gradient(135deg, #0b2447 0%, #1a4a6b 30%, #b5722c 70%, #b13e1a 100%);
+      border-radius: 20px;
+      opacity: 0.8;
+      position: relative;
+    }
+    .heat-spot {
+      position: absolute;
+      width: 60px; height: 60px;
+      background: radial-gradient(circle, #f97316, #dc2626 60%, transparent);
+      border-radius: 50%;
+      filter: blur(12px);
+      opacity: 0.7;
+      animation: pulseGlow 2.4s infinite;
+      top: 30%; left: 20%;
+    }
+    .heat-spot:nth-child(2) { top: 60%; left: 70%; width: 90px; height: 90px; background: radial-gradient(circle, #fbbf24, #ea580c 60%, transparent); animation-delay: 0.8s; }
+    @keyframes pulseGlow { 0% { opacity: 0.3; transform: scale(0.9); } 50% { opacity: 0.9; transform: scale(1.2); } 100% { opacity: 0.3; transform: scale(0.9); } }
+    .map-legend {
+      position: absolute; bottom: 18px; right: 18px;
+      background: rgba(0,0,0,0.5); backdrop-filter: blur(8px);
+      padding: 8px 14px; border-radius: 40px; font-size: 12px; display: flex; gap: 16px;
+    }
+    .map-legend span::before { content: ''; display: inline-block; width: 12px; height: 12px; border-radius: 4px; margin-right: 6px; }
+
+    /* right panel */
+    .right-panel {
+      display: flex; flex-direction: column; gap: 14px;
+    }
+    .ai-card {
+      background: rgba(18, 25, 40, 0.5); backdrop-filter: blur(8px);
+      border-radius: 24px; padding: 18px 20px;
+      border: 1px solid #1d2a40;
+    }
+    .ai-card .title { font-weight: 500; color: #b3c7e5; margin-bottom: 12px; font-size: 15px; }
+    .insight-row { display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid #1f2b3f; }
+    .insight-row:last-child { border: none; }
+
+    /* sliders */
+    .slider-section {
+      background: rgba(18, 25, 40, 0.4); backdrop-filter: blur(8px);
+      border-radius: 28px; padding: 20px 22px;
+      border: 1px solid #1d2a40;
+      margin: 10px 0 8px;
+    }
+    .slider-item { margin: 16px 0; }
+    .slider-item label { display: flex; justify-content: space-between; font-size: 14px; color: #bcccff; }
+    input[type="range"] { width: 100%; margin: 6px 0; background: transparent; accent-color: #3b82f6; }
+
+    .btn-run {
+      background: linear-gradient(135deg, #3b82f6, #06b6d4);
+      border: none; color: white; font-weight: 600; padding: 16px 0;
+      border-radius: 60px; width: 100%; font-size: 18px;
+      cursor: pointer; transition: 0.2s; box-shadow: 0 4px 20px #3b82f660;
+    }
+    .btn-run:hover { transform: scale(1.02); box-shadow: 0 8px 32px #3b82f690; }
+
+    .compare-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin: 12px 0; }
+    .compare-card { background: rgba(0,0,0,0.25); border-radius: 20px; padding: 16px; border: 1px solid #293550; }
+    .compare-card .big { font-size: 28px; font-weight: 600; }
+
+    .budget-section { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+    .budget-section input { background: #101827; border: 1px solid #2a3450; border-radius: 40px; padding: 10px 20px; color: white; width: 160px; }
+
+    .timeline {
+      display: flex; justify-content: space-between; margin: 20px 0 8px; flex-wrap: wrap;
+    }
+    .timeline-step { background: rgba(59,130,246,0.08); padding: 6px 12px; border-radius: 40px; font-size: 12px; border: 1px solid #1d2a40; }
+
+    .bottom-heatmaps { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin: 10px 0; }
+    .heatmap-placeholder { height: 100px; border-radius: 20px; background: linear-gradient(135deg, #0b2a3b, #2d4b5c); display: flex; align-items: center; justify-content: center; border: 1px solid #2a4055; }
+
+    /* copilot */
+    .copilot {
+      position: fixed; bottom: 30px; right: 30px; width: 280px;
+      background: rgba(10, 16, 28, 0.85); backdrop-filter: blur(18px);
+      border-radius: 32px; padding: 18px 20px;
+      border: 1px solid #3b82f660; box-shadow: 0 20px 60px #000000cc;
+      z-index: 999;
+    }
+    .copilot .header { display: flex; gap: 8px; align-items: center; color: #06b6d4; }
+    .copilot .chat-text { font-size: 14px; color: #c8d6f0; margin-top: 10px; }
+
+    /* responsive */
+    @media (max-width: 1200px) { .dashboard-grid { grid-template-columns: 1fr 1fr; } }
+    @media (max-width: 900px) { .dashboard-grid { grid-template-columns: 1fr; } .stats-row { grid-template-columns: repeat(2,1fr); } .sidebar { width: 56px; min-width: 56px; } .copilot { display: none; } }
+    @media (max-width: 600px) { .stats-row { grid-template-columns: 1fr; } .navbar .right-group { gap: 8px; } .compare-grid { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <!-- sidebar -->
+  <div class="sidebar glass">
+    <i class="fas fa-home active"></i>
+    <i class="fas fa-map"></i>
+    <i class="fas fa-robot"></i>
+    <i class="fas fa-tree"></i>
+    <i class="fas fa-chart-line"></i>
+    <i class="fas fa-cog"></i>
+  </div>
+
+  <div class="main-wrapper">
+    <!-- navbar -->
+    <div class="navbar glass">
+      <span class="brand"><i class="fas fa-satellite" style="margin-right: 8px; color: #06b6d4;"></i>URBAN HEAT AI · ISRO</span>
+      <div class="right-group">
+        <span class="city-dropdown"><i class="fas fa-chevron-down" style="margin-right: 6px;"></i>Bengaluru</span>
+        <span style="color:#8b9bb8; font-size: 14px;"><i class="far fa-clock"></i> 14:32 IST</span>
+        <div class="search"><i class="fas fa-search"></i><input placeholder="Search layers..."></div>
+        <span class="avatar"><i class="fas fa-user" style="font-size: 18px;"></i></span>
+        <i class="fas fa-bell" style="color: #8b9bb8; font-size: 20px;"></i>
+      </div>
+    </div>
+
+    <!-- stats cards -->
+    <div class="stats-row">
+      <div class="stat-card glass"><div class="label"><i class="fas fa-fire" style="color: #f97316;"></i> Max Surface Temp</div><div class="value">46.2°C</div><div class="sub">↑ 1.8°C</div></div>
+      <div class="stat-card glass"><div class="label"><i class="fas fa-leaf" style="color: #4ade80;"></i> Avg Green Cover</div><div class="value">18%</div><div class="sub">+2%</div></div>
+      <div class="stat-card glass"><div class="label"><i class="fas fa-city" style="color: #fbbf24;"></i> Built-up Area</div><div class="value">61%</div><div class="sub">+3%</div></div>
+      <div class="stat-card glass"><div class="label"><i class="fas fa-water" style="color: #38bdf8;"></i> Water Bodies</div><div class="value">6%</div><div class="sub">-0.5%</div></div>
+      <div class="stat-card glass"><div class="label"><i class="fas fa-temperature-high" style="color: #ef4444;"></i> Heat Stress Index</div><div class="value" style="color: #f97316;">Very High</div><div class="sub">Risk level 4/5</div></div>
+    </div>
+
+    <!-- dashboard grid -->
+    <div class="dashboard-grid">
+      <!-- map -->
+      <div class="map-container glass">
+        <div class="map-gradient">
+          <div class="heat-spot"></div>
+          <div class="heat-spot"></div>
+        </div>
+        <div class="map-legend"><span style="background:#3b82f6;"></span> 25°C <span style="background:#fbbf24;"></span> 35°C <span style="background:#ef4444;"></span> 45°C+</div>
+      </div>
+
+      <!-- right panel -->
+      <div class="right-panel">
+        <div class="ai-card glass">
+          <div class="title"><i class="fas fa-brain" style="color: #06b6d4;"></i> AI Insights</div>
+          <div class="insight-row"><span>Highest Heat Zone</span><span style="color:#f97316;">Area A · 46.8°C</span></div>
+          <div class="insight-row"><span>Main Cause</span><span>Low Vegetation</span></div>
+          <div class="insight-row"><span>Confidence</span><span>94%</span></div>
+          <div class="insight-row"><span>Recommendation</span><span style="color:#4ade80;">Increase Tree Cover</span></div>
+        </div>
+        <!-- sliders -->
+        <div class="slider-section glass">
+          <div style="font-weight:500; margin-bottom:6px;"><i class="fas fa-sliders-h"></i> Cooling Scenario Simulator</div>
+          <div class="slider-item"><label>🌳 Tree Cover <span id="treeVal">30%</span></label><input type="range" min="0" max="100" value="30" class="slider" data-target="treeVal"></div>
+          <div class="slider-item"><label>🏠 Cool Roof Adoption <span id="roofVal">20%</span></label><input type="range" min="0" max="100" value="20" class="slider" data-target="roofVal"></div>
+          <div class="slider-item"><label>💧 Water Body Expansion <span id="waterVal">10%</span></label><input type="range" min="0" max="100" value="10" class="slider" data-target="waterVal"></div>
+          <div class="slider-item"><label>🛣️ Road Albedo <span id="albedoVal">15%</span></label><input type="range" min="0" max="100" value="15" class="slider" data-target="albedoVal"></div>
+          <button class="btn-run" id="runSimBtn"><i class="fas fa-rocket"></i> Run AI Simulation</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- result comparison -->
+    <div class="compare-grid">
+      <div class="compare-card glass"><div class="label">BEFORE</div><div class="big">44.2°C</div><div>Heat Index 42</div><div>Green Cover 18%</div></div>
+      <div class="compare-card glass" id="afterCard"><div class="label">AFTER (predicted)</div><div class="big" id="predTemp">41.8°C</div><div id="reduction">Reduction 2.4°C</div><div id="heatIdx">Heat Index 38</div><div id="improvePct">Improvement 9%</div></div>
+    </div>
+
+    <!-- bar chart & budget -->
+    <div style="display:grid; grid-template-columns: 1.2fr 0.9fr; gap:14px;">
+      <div class="glass" style="padding:18px; border-radius:28px;">
+        <div style="font-weight:500;">📊 Strategy comparison</div>
+        <div style="display:flex; gap:20px; margin-top:16px; flex-wrap:wrap;">
+          <div><span style="background:#3b82f6; display:inline-block; width:30px; height:12px; border-radius:6px;"></span> Tree Cover 34%</div>
+          <div><span style="background:#06b6d4; display:inline-block; width:30px; height:12px; border-radius:6px;"></span> Cool Roof 28%</div>
+          <div><span style="background:#f97316; display:inline-block; width:30px; height:12px; border-radius:6px;"></span> Water 22%</div>
+          <div><span style="background:#4ade80; display:inline-block; width:30px; height:12px; border-radius:6px;"></span> Mixed 46% <i class="fas fa-star" style="color:#fbbf24;"></i></div>
+        </div>
+      </div>
+      <div class="glass" style="padding:18px; border-radius:28px;">
+        <div class="budget-section"><span>💰 Budget Optimizer</span><input type="text" value="₹10 Crore" id="budgetInput"></div>
+        <div style="display:flex; gap:16px; margin-top:12px; flex-wrap:wrap;">
+          <span>Trees <span style="color:#4ade80;">45%</span></span>
+          <span>Cool Roofs <span style="color:#06b6d4;">30%</span></span>
+          <span>Water <span style="color:#38bdf8;">25%</span></span>
+          <span style="color:#f97316;">Expected Cooling 3.1°C</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- timeline -->
+    <div class="glass" style="padding:16px 22px; border-radius:32px; margin:8px 0;">
+      <div style="display:flex; gap:12px; flex-wrap:wrap; justify-content:space-between;">
+        <span class="timeline-step" style="background:#3b82f640;"><i class="fas fa-check-circle" style="color:#4ade80;"></i> Loading Data</span>
+        <span class="timeline-step" style="background:#3b82f640;"><i class="fas fa-check-circle" style="color:#4ade80;"></i> Extracting Features</span>
+        <span class="timeline-step" style="background:#3b82f640;"><i class="fas fa-spinner fa-pulse"></i> Running AI Model</span>
+        <span class="timeline-step">Physics Validation</span>
+        <span class="timeline-step">Optimization</span>
+        <span class="timeline-step">Scenario Generated</span>
+      </div>
+    </div>
+
+    <!-- before after heatmaps -->
+    <div class="bottom-heatmaps">
+      <div class="heatmap-placeholder glass"><i class="fas fa-map"></i> Before · 44.2°C</div>
+      <div class="heatmap-placeholder glass" id="afterHeatmap"><i class="fas fa-map"></i> After · 41.8°C</div>
+    </div>
+  </div>
+
+  <!-- copilot -->
+  <div class="copilot glass">
+    <div class="header"><i class="fas fa-robot" style="color:#06b6d4;"></i> AI Copilot</div>
+    <div class="chat-text"><i class="fas fa-circle" style="color:#4ade80; font-size:8px;"></i> Why hot? Low vegetation + high built-up.</div>
+    <div class="chat-text"><i class="fas fa-circle" style="color:#4ade80; font-size:8px;"></i> Best intervention: tree cover + cool roofs.</div>
+    <div class="chat-text"><i class="fas fa-circle" style="color:#4ade80; font-size:8px;"></i> Expected reduction: 2.8°C</div>
+  </div>
+
+  <script>
+    (function() {
+      // sliders
+      document.querySelectorAll('.slider').forEach(slider => {
+        slider.addEventListener('input', function() {
+          const targetId = this.dataset.target;
+          document.getElementById(targetId).textContent = this.value + '%';
+        });
+      });
+
+      // simulation
+      const runBtn = document.getElementById('runSimBtn');
+      const predTemp = document.getElementById('predTemp');
+      const reduction = document.getElementById('reduction');
+      const heatIdx = document.getElementById('heatIdx');
+      const improvePct = document.getElementById('improvePct');
+      const afterHeatmap = document.getElementById('afterHeatmap');
+
+      runBtn.addEventListener('click', function() {
+        this.innerHTML = '<i class="fas fa-spinner fa-pulse"></i> Simulating...';
+        this.disabled = true;
+        setTimeout(() => {
+          // random realistic results
+          const baseTemp = 44.2;
+          const tree = parseInt(document.getElementById('treeVal').textContent);
+          const roof = parseInt(document.getElementById('roofVal').textContent);
+          const water = parseInt(document.getElementById('waterVal').textContent);
+          const albedo = parseInt(document.getElementById('albedoVal').textContent);
+          const reductionVal = (tree * 0.028 + roof * 0.018 + water * 0.022 + albedo * 0.012).toFixed(1);
+          const newTemp = (baseTemp - parseFloat(reductionVal)).toFixed(1);
+          const newHeat = Math.max(28, 42 - parseFloat(reductionVal) * 1.3).toFixed(0);
+          const improvement = (parseFloat(reductionVal) / 44.2 * 100).toFixed(1);
+          predTemp.textContent = newTemp + '°C';
+          reduction.textContent = `Reduction ${reductionVal}°C`;
+          heatIdx.textContent = `Heat Index ${newHeat}`;
+          improvePct.textContent = `Improvement ${improvement}%`;
+          afterHeatmap.innerHTML = `<i class="fas fa-map"></i> After · ${newTemp}°C`;
+          this.innerHTML = '<i class="fas fa-rocket"></i> Run AI Simulation';
+          this.disabled = false;
+        }, 1800);
+      });
+    })();
+  </script>
+</body>
+</html>

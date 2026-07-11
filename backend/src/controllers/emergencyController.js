@@ -57,7 +57,7 @@ exports.getSession = async (req, res, next) => {
 
     if (
       session.userId.toString() !== req.user.userId.toString() &&
-      req.user.role !== 'ADMIN'
+      req.user.role.toLowerCase() !== 'admin'
     ) {
       return next(new AppError('Not authorized to view this session', 403));
     }

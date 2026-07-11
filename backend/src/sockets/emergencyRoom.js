@@ -1,5 +1,4 @@
 const jwt = require('jsonwebtoken');
-const { WebSocketServer } = require('ws');
 const EmergencySession = require('../models/EmergencySession');
 const { haversineDistance, getSingleETA } = require('../services/mapsService');
 const redis = require('../config/redis');
@@ -8,67 +7,36 @@ const logger = require('../utils/logger');
 let io;
 
 // Track active ETA intervals: sessionId → intervalId
-// Stored in memory — lives as long as the server process
 const etaIntervals = new Map();
-
-function extractSocketToken(socket) {
-  const authHeader = socket.handshake.headers?.authorization;
-  if (typeof authHeader === 'string' && authHeader.startsWith('Bearer ')) {
-    return authHeader.slice(7).trim();
-  }
-
-  const authToken = socket.handshake.auth?.token || socket.handshake.query?.token;
-  if (typeof authToken === 'string') {
-    return authToken.startsWith('Bearer ') ? authToken.slice(7).trim() : authToken;
-  }
-
-  return null;
-}
 
 function initSocket(server) {
   const { Server } = require('socket.io');
   const allowedOrigin = process.env.CLIENT_URL || 'http://localhost:3000';
+
   io = new Server(server, {
     cors: {
-      origin: allowedOrigin,
+      origin: '*',
       methods: ['GET', 'POST'],
       credentials: true,
     },
   });
 
-  const wss = new WebSocketServer({ server, path: '/' });
-  wss.on('connection', (socket, req) => {
-    try {
-      const token = req.headers.authorization?.startsWith('Bearer ')
-        ? req.headers.authorization.slice(7).trim()
-        : null;
-
-      if (!token) {
-        socket.close(1008, 'Authentication required');
-        return;
-      }
-
-      const decoded = jwt.verify(token, process.env.JWT_SECRET, { ignoreExpiration: true });
-      socket.user = decoded;
-      logger.info(`Raw WebSocket connected: ${decoded.userId || decoded.sub}`);
-      socket.send(JSON.stringify({
-        type: 'connected',
-        userId: decoded.userId,
-        role: decoded.role,
-        message: 'WebSocket authentication succeeded',
-      }));
-    } catch (err) {
-      logger.warn('Raw WebSocket authentication failed', err);
-      socket.close(1008, 'Invalid token');
-    }
-  });
-
   // JWT middleware — rejects unauthenticated sockets before connection opens
   io.use((socket, next) => {
-    const token = extractSocketToken(socket);
-    if (!token) return next(new Error('Authentication required'));
     try {
-      const decoded = jwt.verify(token, process.env.JWT_SECRET, { ignoreExpiration: true });
+      // Support token via handshake.auth.token OR Authorization header
+      let token = socket.handshake.auth?.token;
+
+      if (!token) {
+        const authHeader = socket.handshake.headers?.authorization;
+        if (authHeader?.startsWith('Bearer ')) {
+          token = authHeader.slice(7).trim();
+        }
+      }
+
+      if (!token) return next(new Error('Authentication required'));
+
+      const decoded = jwt.verify(token, process.env.JWT_SECRET);
       socket.user = decoded;
       next();
     } catch (err) {
@@ -77,7 +45,7 @@ function initSocket(server) {
   });
 
   io.on('connection', (socket) => {
-    logger.info(`Socket connected: ${socket.id} | user: ${socket.user.userId}`);
+    logger.info(`Socket connected: ${socket.id} | user: ${socket.user.userId} | role: ${socket.user.role}`);
 
     // ── Patient joins session room ──────────────────────────────────────────
     socket.on('join_session', async ({ sessionId }) => {
@@ -86,7 +54,8 @@ function initSocket(server) {
         if (!session) return socket.emit('error', { message: 'Session not found' });
 
         const isOwner = session.userId.toString() === socket.user.userId;
-        const isAdmin = socket.user.role === 'admin';
+        const isAdmin = socket.user.role.toLowerCase() === 'admin';
+
         if (!isOwner && !isAdmin) {
           return socket.emit('error', { message: 'Not authorized' });
         }
@@ -103,7 +72,8 @@ function initSocket(server) {
     // ── Driver joins session room ───────────────────────────────────────────
     socket.on('join_as_driver', async ({ sessionId }) => {
       try {
-        if (socket.user.role !== 'driver' && socket.user.role !== 'admin') {
+        const role = socket.user.role.toLowerCase();
+        if (role !== 'driver' && role !== 'admin') {
           return socket.emit('error', { message: 'Driver role required' });
         }
 
@@ -113,16 +83,15 @@ function initSocket(server) {
         socket.join(`session:${sessionId}`);
         socket.currentSessionId = sessionId;
 
-        // Store patient location on socket for ETA calculations
-        socket.patientLocation = {
-          latitude: session.location.coordinates[1],
-          longitude: session.location.coordinates[0],
-        };
+       socket.patientLocation = {
+         latitude: session.location.lat,
+         longitude: session.location.lng,
+       };
 
         socket.emit('joined_as_driver', { sessionId });
         logger.info(`Driver ${socket.user.userId} joined room session:${sessionId}`);
 
-        // ── Start ETA recalculation interval ───────────────────────────────
+        // Start ETA recalculation interval
         startETAInterval(socket, sessionId);
       } catch (err) {
         logger.error('join_as_driver error', err);
@@ -133,7 +102,8 @@ function initSocket(server) {
     // ── Driver location update with delta compression ───────────────────────
     socket.on('location_update', async ({ latitude, longitude }) => {
       try {
-        if (socket.user.role !== 'driver' && socket.user.role !== 'admin') {
+        const role = socket.user.role.toLowerCase();
+        if (role !== 'driver' && role !== 'admin') {
           return socket.emit('error', { message: 'Driver role required' });
         }
 
@@ -160,12 +130,18 @@ function initSocket(server) {
             latitude, longitude
           );
           if (distanceKm * 1000 < 10) {
-            logger.debug(`Delta compression: driver ${socket.user.userId} moved ${(distanceKm * 1000).toFixed(1)}m — skipped`);
+            logger.debug(
+              `Delta compression: driver ${socket.user.userId} moved ${(distanceKm * 1000).toFixed(1)}m — skipped`
+            );
             return;
           }
         }
 
-        const locationData = { latitude, longitude, timestamp: new Date().toISOString() };
+        const locationData = {
+          latitude,
+          longitude,
+          timestamp: new Date().toISOString(),
+        };
         await redis.set(ambulanceKey, JSON.stringify(locationData), 'EX', 300);
 
         // Update cached driver location on socket so ETA interval uses fresh coords
@@ -178,7 +154,9 @@ function initSocket(server) {
           timestamp: locationData.timestamp,
         });
 
-        logger.debug(`Driver ${socket.user.userId} location broadcast → session:${socket.currentSessionId}`);
+        logger.debug(
+          `Driver ${socket.user.userId} location broadcast → session:${socket.currentSessionId}`
+        );
       } catch (err) {
         logger.error('location_update error', err);
         socket.emit('error', { message: 'Failed to process location update' });
@@ -186,12 +164,42 @@ function initSocket(server) {
     });
 
     // ── Disconnect ──────────────────────────────────────────────────────────
-    socket.on('disconnect', () => {
+    socket.on('disconnect', async () => {
       logger.info(`Socket disconnected: ${socket.id} | user: ${socket.user.userId}`);
-      // Stop ETA interval if this was a driver
-      if (socket.currentSessionId) {
-        stopETAInterval(socket.currentSessionId);
+
+      if (!socket.currentSessionId) return;
+
+      const sessionId = socket.currentSessionId;
+      const userId = socket.user.userId;
+
+      // 1. Stop ETA interval
+      stopETAInterval(sessionId);
+
+      // 2. Preserve last known location for 5 minutes
+      const locationKey = `ambulance:${userId}:location`;
+      const lastLocation = await redis.get(locationKey);
+
+      if (lastLocation) {
+        await redis.expire(locationKey, 300);
+        logger.info(`Driver ${userId} disconnected — location preserved for 5min`);
+      } else {
+        logger.info(`Driver ${userId} disconnected — no location to preserve`);
       }
+
+      // 3. Emit driver_disconnected to session room
+      const parsedLocation = lastLocation ? JSON.parse(lastLocation) : null;
+
+      io.to(`session:${sessionId}`).emit('driver_disconnected', {
+        driverId: userId,
+        sessionId,
+        lastKnownLocation: parsedLocation
+          ? { latitude: parsedLocation.latitude, longitude: parsedLocation.longitude }
+          : null,
+        disconnectedAt: new Date().toISOString(),
+        locationPreservedUntil: parsedLocation
+          ? new Date(Date.now() + 300000).toISOString()
+          : null,
+      });
     });
   });
 
@@ -201,14 +209,12 @@ function initSocket(server) {
 // ── ETA interval helpers ────────────────────────────────────────────────────
 
 function startETAInterval(socket, sessionId) {
-  // Prevent duplicate intervals for the same session
   if (etaIntervals.has(sessionId)) {
     clearInterval(etaIntervals.get(sessionId));
   }
 
   const intervalId = setInterval(async () => {
     try {
-      // Need driver's current location — read from socket or Redis
       const driverLoc = socket.driverLocation ||
         await getDriverLocationFromRedis(socket.user.userId);
 
@@ -222,15 +228,12 @@ function startETAInterval(socket, sessionId) {
 
       const etaMinutes = await getSingleETA(dLat, dLng, pLat, pLng);
 
-      // Store in Redis with 90s TTL — slightly longer than the 30s interval
-      // so the value is always fresh but expires if the interval stops
       const etaKey = `session:${sessionId}:eta`;
       await redis.set(etaKey, JSON.stringify({
         etaMinutes,
         calculatedAt: new Date().toISOString(),
       }), 'EX', 90);
 
-      // Broadcast updated ETA to session room
       io.to(`session:${sessionId}`).emit('eta_update', {
         sessionId,
         etaMinutes,
@@ -241,7 +244,7 @@ function startETAInterval(socket, sessionId) {
     } catch (err) {
       logger.error(`ETA interval error for session ${sessionId}`, err);
     }
-  }, 30000); // 30 seconds
+  }, 30000);
 
   etaIntervals.set(sessionId, intervalId);
   logger.info(`ETA interval started for session ${sessionId}`);
@@ -265,4 +268,4 @@ function getIO() {
   return io;
 }
 
-module.exports = { initSocket, getIO, extractSocketToken };
+module.exports = { initSocket, getIO };
