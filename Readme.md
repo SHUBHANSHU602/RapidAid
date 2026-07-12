@@ -510,13 +510,11 @@ Real emergencies are not binary. Sometimes a reroute is enough. Sometimes you ne
 
 ---
 
-## License
 
-MIT — see [LICENSE](LICENSE) for details.
 
 ---
 
 <div align="center">
   <p>Built by <a href="https://github.com/SHUBHANSHU602">Shubhanshu Singh</a></p>
-  <p><sub>If this saved you time, leave a ⭐</sub></p>
+ 
 </div>
