@@ -1,6 +1,8 @@
 const EmergencySession = require('../models/EmergencySession');
 const AppError = require('../utils/AppError');
 const { assignAmbulance } = require('../services/assignmentService');
+const { scheduleDelayDetection } = require('../workers/delayDetection.worker');
+const logger = require('../utils/logger');
 
 exports.triggerEmergency = async (req, res, next) => {
   try {
@@ -18,13 +20,21 @@ exports.triggerEmergency = async (req, res, next) => {
     // can join the session room before the assignment event is emitted.
     setTimeout(() => {
       assignAmbulance(session._id, lat, lng)
-        .then((result) => {
+        .then(async (result) => {
           if (result) {
-            console.log(`Assigned ambulance ${result.ambulanceId} in ${result.latency}ms`);
+            logger.info(`Assigned ambulance ${result.ambulanceId} in ${result.latency}ms`);
+
+            // Schedule delay detection after successful assignment
+            try {
+              const etaMinutes = Math.ceil((result.etaSeconds || 0) / 60) || 5;
+              await scheduleDelayDetection(session._id.toString(), etaMinutes);
+            } catch (err) {
+              logger.warn('Failed to schedule delay detection', err.message);
+            }
           }
         })
         .catch((err) => {
-          console.error('Assignment failed:', err.message);
+          logger.error('Assignment failed:', err.message);
         });
     }, 500);
 

@@ -6,6 +6,7 @@ const logger = require('./src/utils/logger');
 const { syncAmbulancesToRedis } = require('./src/services/ambulanceCache');
 const { initSocket } = require('./src/sockets/emergencyRoom');
 
+require('./src/workers/delayDetection.worker');
 const PORT = process.env.PORT || 5000;
 
 const startServer = async () => {
