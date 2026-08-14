@@ -144,7 +144,73 @@ exports.transitionSession = async (req, res, next) => {
         }
       }
     }
+const { cancelDelayDetection } = require('../workers/delayDetection.worker');
 
+/**
+ * POST /api/v1/emergency/:id/transition
+ * Transition session to a new state with optional metadata.
+ * Enforces valid state machine transitions server-side.
+ */
+exports.transitionSession = async (req, res, next) => {
+  try {
+    const { status, metadata = {} } = req.body;
+
+    const validTransitions = {
+      INITIATED:  ['ASSIGNED'],
+      ASSIGNED:   ['EN_ROUTE', 'CANCELLED'],
+      EN_ROUTE:   ['DELAYED', 'RESOLVED'],
+      DELAYED:    ['EN_ROUTE', 'RESOLVED', 'CANCELLED'],
+    };
+
+    const session = await EmergencySession.findById(req.params.id);
+    if (!session) return next(new AppError('Session not found', 404));
+
+    const isOwner = session.userId.toString() === req.user.userId;
+    const isAdmin = req.user.role.toLowerCase() === 'admin';
+    if (!isOwner && !isAdmin) return next(new AppError('Not authorized', 403));
+
+    const allowed = validTransitions[session.status] || [];
+    if (!allowed.includes(status)) {
+      return next(new AppError(
+        `Cannot transition from ${session.status} to ${status}. Allowed: ${allowed.join(', ')}`,
+        400
+      ));
+    }
+
+    const previousStatus = session.status;
+    session.status = status;
+    session.addEvent(status, { previousStatus, ...metadata });
+
+    if (status === 'RESOLVED') {
+      session.resolvedAt = new Date();
+      try {
+        await cancelDelayDetection(session._id.toString());
+      } catch (e) {
+        logger.warn('transitionSession: cancelDelayDetection failed', e.message);
+      }
+    }
+
+    await session.save();
+
+    // Emit to session room
+    try {
+      const { getIO } = require('../sockets/emergencyRoom');
+      getIO().to(`session:${session._id}`).emit('session_status_changed', {
+        sessionId: session._id,
+        previousStatus,
+        newStatus: status,
+        metadata,
+        changedAt: new Date().toISOString(),
+      });
+    } catch (e) {
+      logger.warn('transitionSession: socket emit failed', e.message);
+    }
+
+    res.status(200).json({ success: true, data: session });
+  } catch (err) {
+    next(err);
+  }
+};
     // Emit session_status_changed event to room
     try {
       const io = getIO();

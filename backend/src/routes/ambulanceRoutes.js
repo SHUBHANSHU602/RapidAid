@@ -11,7 +11,13 @@ const {
 } = require('../controllers/ambulanceController');
 router.use(protect);
 
+const {
+  triggerEmergency,
+  getSession,
+  transitionSession,
+} = require('../controllers/emergencyController');
 
+router.post('/:id/transition', protect, transitionSession);
 router.get('/', getAllAmbulances);
 router.get('/:id', getAmbulanceById);
 router.patch('/:id/status', restrictTo('ADMIN'), updateAmbulanceStatus);
