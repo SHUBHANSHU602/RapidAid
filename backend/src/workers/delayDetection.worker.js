@@ -3,8 +3,7 @@ const redis = require('../config/redis');
 const EmergencySession = require('../models/EmergencySession');
 const logger = require('../utils/logger');
 
-// Parse REDIS_URL for Bull — Bull needs individual params not a full URL
-// Upstash format: rediss://:password@host:port
+// Parse REDIS_URL for Bull
 function parseRedisUrl(url) {
   const parsed = new URL(url);
   return {
@@ -14,25 +13,17 @@ function parseRedisUrl(url) {
     tls: url.startsWith('rediss://') ? {} : undefined,
   };
 }
-const redisConfig = parseRedisUrl(process.env.REDIS_URL);
-logger.info('Bull Redis config: ' + JSON.stringify({
-  host: redisConfig.host,
-  port: redisConfig.port,
-  hasPassword: !!redisConfig.password,
-  hasTLS: !!redisConfig.tls
-}));
 
-// Create Bull queue backed by Redis
+const redisConfig = parseRedisUrl(process.env.REDIS_URL);
+
 const delayQueue = new Bull('delay-detection', { redis: redisConfig });
 
 /**
  * Schedule a repeating delay detection job for a session.
- * Called when ambulance is assigned.
  * @param {string} sessionId
  * @param {number} initialEtaMinutes
  */
 async function scheduleDelayDetection(sessionId, initialEtaMinutes) {
-  // Remove existing job first to avoid duplicates
   const existingJobs = await delayQueue.getRepeatableJobs();
   const existing = existingJobs.find(j => j.id === `delay:${sessionId}`);
   if (existing) {
@@ -42,8 +33,8 @@ async function scheduleDelayDetection(sessionId, initialEtaMinutes) {
   await delayQueue.add(
     { sessionId, initialEtaMinutes },
     {
-      repeat: { every: 60000 }, // every 60 seconds
-      jobId: `delay:${sessionId}`, // idempotent key
+      repeat: { every: 60000 },
+      jobId: `delay:${sessionId}`,
     }
   );
 
@@ -67,7 +58,7 @@ async function cancelDelayDetection(sessionId) {
   }
 }
 
-// ── Worker — processes each job ─────────────────────────────────────────────
+// ── Worker ──────────────────────────────────────────────────────────────────
 delayQueue.process(async (job) => {
   const { sessionId, initialEtaMinutes } = job.data;
 
@@ -110,25 +101,67 @@ delayQueue.process(async (job) => {
       `Delay check: session ${sessionId} | initial=${initialEtaMinutes}min | current=${currentEta}min | drift=${drift}min`
     );
 
-    // 5. Drift threshold — 3 minutes
+    // 5. Drift threshold — trigger delay logic if drift > 3 minutes
     if (drift > 3) {
-      logger.warn(`Delay detected: session ${sessionId} drifted ${drift}min beyond initial ETA`);
-      // Day 20 will handle fallback trigger here
+      await handleDelay(sessionId, drift, initialEtaMinutes, currentEta);
     }
 
   } catch (err) {
     logger.error(`Delay detection error: session ${sessionId}`, err);
-    throw err; // Bull will retry the job
+    throw err;
   }
 });
 
+// ── Delay handler ───────────────────────────────────────────────────────────
+async function handleDelay(sessionId, drift, initialEtaMinutes, currentEta) {
+  logger.warn(`Delay detected: session ${sessionId} drifted ${drift}min beyond initial ETA`);
+
+  // Load fresh session — not lean() so we can call instance methods
+  const session = await EmergencySession.findById(sessionId);
+
+  if (!session) return;
+
+  // Only trigger if currently EN_ROUTE — not already DELAYED or RESOLVED
+  if (session.status !== 'EN_ROUTE') {
+    logger.debug(`Delay handler: session ${sessionId} is ${session.status} — skipping delay trigger`);
+    return;
+  }
+
+  // Update status and write to eventLog
+  session.status = 'DELAYED';
+  session.addEvent('DELAYED', {
+    drift,
+    initialEta: initialEtaMinutes,
+    currentEta,
+    detectedAt: new Date().toISOString(),
+  });
+  await session.save();
+
+  logger.info(`Session ${sessionId} status → DELAYED`);
+
+  // Emit delay_detected to session room
+  try {
+    const { getIO } = require('../sockets/emergencyRoom');
+    const io = getIO();
+    io.to(`session:${sessionId}`).emit('delay_detected', {
+      sessionId,
+      drift,
+      currentEta,
+      message: 'Ambulance is delayed. Evaluating alternatives.',
+    });
+    logger.info(`Emitted delay_detected to session:${sessionId}`);
+  } catch (err) {
+    logger.warn(`Could not emit delay_detected — socket may not be initialized`, err.message);
+  }
+}
+
 // ── Queue event listeners ───────────────────────────────────────────────────
 delayQueue.on('failed', (job, err) => {
-  logger.error(`Delay job failed: ${job.id}`, err.message);
+  logger.error(`Delay job failed: ${job.id} | ${err.message}`);
 });
 
 delayQueue.on('error', (err) => {
-  logger.error('Delay queue error: ' + err.message + ' | ' + err.stack);
+  logger.error(`Delay queue error: ${err.message}`);
 });
 
 module.exports = { delayQueue, scheduleDelayDetection, cancelDelayDetection };
