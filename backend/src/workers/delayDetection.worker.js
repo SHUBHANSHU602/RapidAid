@@ -114,20 +114,16 @@ delayQueue.process(async (job) => {
 
 // ── Delay handler ───────────────────────────────────────────────────────────
 async function handleDelay(sessionId, drift, initialEtaMinutes, currentEta) {
-  logger.warn(`Delay detected: session ${sessionId} drifted ${drift}min beyond initial ETA`);
+  logger.warn(`Delay detected: session ${sessionId} drifted ${drift}min`);
 
-  // Load fresh session — not lean() so we can call instance methods
   const session = await EmergencySession.findById(sessionId);
-
   if (!session) return;
 
-  // Only trigger if currently EN_ROUTE — not already DELAYED or RESOLVED
   if (session.status !== 'EN_ROUTE') {
-    logger.debug(`Delay handler: session ${sessionId} is ${session.status} — skipping delay trigger`);
+    logger.debug(`Delay handler: session ${sessionId} is ${session.status} — skipping`);
     return;
   }
 
-  // Update status and write to eventLog
   session.status = 'DELAYED';
   session.addEvent('DELAYED', {
     drift,
@@ -137,24 +133,22 @@ async function handleDelay(sessionId, drift, initialEtaMinutes, currentEta) {
   });
   await session.save();
 
-  logger.info(`Session ${sessionId} status → DELAYED`);
-
-  // Emit delay_detected to session room
   try {
     const { getIO } = require('../sockets/emergencyRoom');
-    const io = getIO();
-    io.to(`session:${sessionId}`).emit('delay_detected', {
+    getIO().to(`session:${sessionId}`).emit('delay_detected', {
       sessionId,
       drift,
       currentEta,
       message: 'Ambulance is delayed. Evaluating alternatives.',
     });
-    logger.info(`Emitted delay_detected to session:${sessionId}`);
-  } catch (err) {
-    logger.warn(`Could not emit delay_detected — socket may not be initialized`, err.message);
+  } catch (e) {
+    logger.warn('Delay handler: socket emit failed', e.message);
   }
-}
 
+  // Trigger fallback chain
+  const { triggerFallback } = require('../services/fallbackService');
+  await triggerFallback(sessionId, currentEta);
+}
 // ── Queue event listeners ───────────────────────────────────────────────────
 delayQueue.on('failed', (job, err) => {
   logger.error(`Delay job failed: ${job.id} | ${err.message}`);
