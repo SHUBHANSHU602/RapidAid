@@ -183,8 +183,76 @@ async function fallbackLevel2(session, currentEta) {
 
 // ── Level 3 + 4 placeholder (Day 22) ─────────────────────────────────────────
 async function fallbackLevel3and4(session, currentEta) {
-  // Day 22 will implement this
-  logger.warn(`Fallback L3+L4 stub: session ${session._id} needs AI + webhook`);
+  const { generateDelayMessage } = require('./ai/fallbackMessageService');
+
+  // ── Level 3: AI message ───────────────────────────────────────────────────
+  try {
+    // Calculate drift from eventLog
+    const delayEvent = session.eventLog
+      .slice()
+      .reverse()
+      .find(e => e.status === 'DELAYED');
+    const drift = delayEvent?.meta?.drift || 0;
+
+    const aiMessage = await generateDelayMessage(session, currentEta, drift);
+
+    // Emit to session room
+    try {
+      const { getIO } = require('../sockets/emergencyRoom');
+      getIO().to(`session:${session._id}`).emit('ai_suggestion', {
+        sessionId: session._id,
+        patientMessage: aiMessage.patientMessage,
+        firstAidAction: aiMessage.firstAidAction,
+      });
+    } catch (e) {
+      logger.warn('Fallback L3: socket emit failed', e.message);
+    }
+
+    // Write to eventLog
+    const liveSession = await EmergencySession.findById(session._id);
+    liveSession.addEvent('AI_SUGGESTION_SENT', {
+      patientMessage: aiMessage.patientMessage,
+      firstAidAction: aiMessage.firstAidAction,
+    });
+    await liveSession.save();
+
+    logger.info(`Fallback L3 complete: session ${session._id}`);
+  } catch (err) {
+    logger.error('Fallback L3 error', err);
+  }
+
+  // ── Level 4: Hospital webhook ─────────────────────────────────────────────
+  try {
+    const Hospital = require('../models/Hospital');
+    const hospital = session.hospitalId
+      ? await Hospital.findById(session.hospitalId).lean()
+      : null;
+
+    const payload = {
+      sessionId: session._id,
+      emergencyType: session.emergencyType,
+      severityLevel: session.severityLevel,
+      patientLocation: session.location,
+      ambulanceDelayed: true,
+      currentEta,
+      timestamp: new Date().toISOString(),
+    };
+
+    // Production: await fetch(hospital.webhookUrl, { method: 'POST', body: JSON.stringify(payload) })
+    // Simulated here — log the payload
+    logger.warn(`Fallback L4: hospital webhook triggered`, payload);
+
+    const liveSession = await EmergencySession.findById(session._id);
+    liveSession.addEvent('HOSPITAL_WEBHOOK_TRIGGERED', {
+      hospitalId: session.hospitalId,
+      payload,
+    });
+    await liveSession.save();
+
+    logger.info(`Fallback L4 complete: session ${session._id}`);
+  } catch (err) {
+    logger.error('Fallback L4 error', err);
+  }
 }
 
 module.exports = { triggerFallback };
