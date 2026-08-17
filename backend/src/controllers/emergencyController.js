@@ -7,7 +7,46 @@ const { updateAmbulanceStatus } = require('../services/ambulanceCache');
 const { getIO } = require('../sockets/emergencyRoom');
 const logger = require('../utils/logger');
 const { triageEmergency } = require('../services/ai/triageService');
+const { selectHospital } = require('../services/ai/hospitalService');
 
+// After triageResult is set:
+let hospitalRanking = [];
+let topHospitalId = null;
+
+try {
+  hospitalRanking = await selectHospital(lat, lng, triageResult, emergencyType);
+  if (hospitalRanking.length > 0) {
+    topHospitalId = hospitalRanking[0].id;
+    logger.info(`Hospital selected: ${hospitalRanking[0].name}`);
+  }
+} catch (err) {
+  logger.warn('Hospital selection failed — no hospital assigned', err.message);
+}
+
+// Create session with hospitalId
+const session = await EmergencySession.create({
+  userId: req.user.userId,
+  location: { lat, lng },
+  emergencyType,
+  severityLevel: finalSeverity,
+  hospitalId: topHospitalId || null,
+});
+
+// Add to response:
+res.status(201).json({
+  success: true,
+  message: 'Emergency session created — assigning ambulance',
+  data: {
+    sessionId: session._id,
+    status: session.status,
+    emergencyType: session.emergencyType,
+    severityLevel: session.severityLevel,
+    location: session.location,
+    createdAt: session.createdAt,
+    triage: triageResult,
+    hospitalRanking,
+  },
+});
 // Inside triggerEmergency, after extracting req.body:
 const { lat, lng, emergencyType, severityLevel, description = '' } = req.body;
 
