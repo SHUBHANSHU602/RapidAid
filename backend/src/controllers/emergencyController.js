@@ -6,7 +6,33 @@ const { scheduleDelayDetection, cancelDelayDetection } = require('../workers/del
 const { updateAmbulanceStatus } = require('../services/ambulanceCache');
 const { getIO } = require('../sockets/emergencyRoom');
 const logger = require('../utils/logger');
+const { triageEmergency } = require('../services/ai/triageService');
 
+// Inside triggerEmergency, after extracting req.body:
+const { lat, lng, emergencyType, severityLevel, description = '' } = req.body;
+
+// Run AI triage if description provided
+let triageResult = null;
+let finalSeverity = severityLevel;
+
+try {
+  triageResult = await triageEmergency(description, emergencyType);
+  // Override severity only when AI is highly confident
+  if (triageResult.confidence === 'high') {
+    finalSeverity = triageResult.severity;
+    logger.info(`Triage override: user=${severityLevel} → ai=${finalSeverity}`);
+  }
+} catch (err) {
+  logger.warn('Triage failed — using user-provided severity', err.message);
+}
+
+// Create session using finalSeverity instead of severityLevel
+const session = await EmergencySession.create({
+  userId: req.user.userId,
+  location: { lat, lng },
+  emergencyType,
+  severityLevel: finalSeverity,
+});
 exports.triggerEmergency = async (req, res, next) => {
   try {
     const { lat, lng, emergencyType, severityLevel } = req.body;
@@ -41,18 +67,19 @@ exports.triggerEmergency = async (req, res, next) => {
         });
     }, 500);
 
-    res.status(201).json({
-      success: true,
-      message: 'Emergency session created — assigning ambulance',
-      data: {
-        sessionId: session._id,
-        status: session.status,
-        emergencyType: session.emergencyType,
-        severityLevel: session.severityLevel,
-        location: session.location,
-        createdAt: session.createdAt,
-      },
-    });
+   res.status(201).json({
+  success: true,
+  message: 'Emergency session created — assigning ambulance',
+  data: {
+    sessionId: session._id,
+    status: session.status,
+    emergencyType: session.emergencyType,
+    severityLevel: session.severityLevel,
+    location: session.location,
+    createdAt: session.createdAt,
+    triage: triageResult,
+  },
+});
   } catch (err) {
     next(err);
   }
