@@ -9,6 +9,15 @@ let adminToken;
 let sessionId;
 
 beforeAll(async () => {
+  await mongoose.connect(process.env.MONGO_URI);
+  await User.deleteOne({ email: 'admin@rapidaid.com' });
+  await User.create({
+    name: 'Admin',
+    email: 'admin@rapidaid.com',
+    password: 'admin123',
+    role: 'ADMIN',
+  });
+
   const res = await request(app)
     .post('/api/v1/auth/login')
     .send({ email: 'admin@rapidaid.com', password: 'admin123' });

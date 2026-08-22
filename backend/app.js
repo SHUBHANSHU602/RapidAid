@@ -15,6 +15,7 @@ const authRoutes = require('./src/routes/authRoutes');
 const ambulanceRoutes = require('./src/routes/ambulanceRoutes');
 const hospitalRoutes = require('./src/routes/hospitalRoutes');
 const emergencyRoutes = require('./src/routes/emergencyRoutes');
+const analyticsRoutes = require('./src/routes/analyticsRoutes');
 
 const app = express();
 
@@ -71,6 +72,7 @@ app.use('/api/v1/auth', authRoutes);
 app.use('/api/v1/ambulances', ambulanceRoutes);
 app.use('/api/v1/hospitals', hospitalRoutes);
 app.use('/api/v1/emergency', emergencyRoutes);
+app.use('/api/v1/analytics', analyticsRoutes);
 
 // 404 handler
 app.use((req, res) => {

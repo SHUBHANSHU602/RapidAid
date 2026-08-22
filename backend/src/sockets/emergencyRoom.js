@@ -23,19 +23,27 @@ function initSocket(server) {
   // ── Redis adapter for horizontal scaling ──────────────────────────────────
   // Creates a pub/sub channel between multiple server instances
   // Any instance can emit to any room — Redis routes it correctly
-  const { createClient } = require('redis');
+  const Redis = require('ioredis');
 
-  const pubClient = createClient({ url: process.env.REDIS_URL });
-  const subClient = pubClient.duplicate();
-
-  Promise.all([pubClient.connect(), subClient.connect()])
-    .then(() => {
-      io.adapter(createAdapter(pubClient, subClient));
-      logger.info('Socket.io Redis adapter connected — horizontal scaling enabled');
-    })
-    .catch(err => {
-      logger.warn('Socket.io Redis adapter failed — running single instance mode', err.message);
+  try {
+    const pubClient = new Redis(process.env.REDIS_URL, {
+      maxRetriesPerRequest: null,
+      enableReadyCheck: false,
     });
+    const subClient = pubClient.duplicate();
+
+    pubClient.on('error', (err) => {
+      logger.warn(`Socket.io Redis pubClient error: ${err.message}`);
+    });
+    subClient.on('error', (err) => {
+      logger.warn(`Socket.io Redis subClient error: ${err.message}`);
+    });
+
+    io.adapter(createAdapter(pubClient, subClient));
+    logger.info('Socket.io Redis adapter initialized — horizontal scaling enabled');
+  } catch (err) {
+    logger.warn('Socket.io Redis adapter failed — running single instance mode', err.message);
+  }
 
   // ── JWT middleware ────────────────────────────────────────────────────────
   io.use((socket, next) => {

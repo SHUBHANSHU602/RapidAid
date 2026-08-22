@@ -37,8 +37,8 @@ async function syncAmbulancesToRedis() {
     pipeline.set(
       `ambulance:${id}:location`,
       JSON.stringify({
-        lat: amb.currentLocation.lat,
-        lng: amb.currentLocation.lng,
+        latitude: amb.currentLocation.lat,
+        longitude: amb.currentLocation.lng,
         geohash,
       })
     );
@@ -100,8 +100,8 @@ async function getAvailableAmbulancesNear(lat, lng, radiusChars = 5) {
     if (location.geohash.startsWith(prefix)) {
       nearby.push({
         ambulanceId: availableIds[i],
-        lat: location.lat,
-        lng: location.lng,
+        lat: location.latitude,
+        lng: location.longitude,
         geohash: location.geohash,
       });
     }

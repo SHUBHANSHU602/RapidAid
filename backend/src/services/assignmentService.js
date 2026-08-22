@@ -7,7 +7,6 @@ const { updateAmbulanceStatus } = require('./ambulanceCache');
 const logger = require('../utils/logger');
 const { getIO } = require('../sockets/emergencyRoom');
 const AVAILABLE_SET_KEY = 'ambulance:available';
-const ngeohash = require('ngeohash');
 
 /**
  * Get geohash zone for a location at precision 4 (city-zone level ~40km x 20km)
@@ -124,7 +123,7 @@ async function assignAmbulance(sessionId, patientLat, patientLng) {
 // After getting available ambulance IDs from Redis
 // Add zone-based pre-filter before scoring
 
-const searchZones = getSearchZones(lat, lng);
+const searchZones = getSearchZones(patientLat, patientLng);
 
 // Filter candidates to only those in relevant zones
 // ambulance:{id}:zone stored in Redis when ambulance synced
@@ -154,28 +153,38 @@ logger.debug(`Geo-partition: ${candidates.length} ambulances → ${filteredCandi
   t.afterScoring = Date.now();
 
   // Step 5: All writes in parallel
+  const currentSession = await EmergencySession.findById(sessionId);
+  if (currentSession && ['RESOLVED', 'CANCELLED'].includes(currentSession.status)) {
+    await updateAmbulanceStatus(best.ambulanceId, 'AVAILABLE');
+    return null;
+  }
+
+  const sessionUpdate = {
+    ambulanceId: best.ambulanceId,
+    $push: {
+      eventLog: {
+        status: 'ASSIGNED',
+        timestamp: new Date(),
+        meta: {
+          ambulanceId: best.ambulanceId,
+          etaSeconds: best.etaSeconds,
+          distanceKm: best.distanceKm,
+          score: best.score,
+        },
+      },
+    },
+  };
+  if (currentSession && currentSession.status === 'INITIATED') {
+    sessionUpdate.status = 'ASSIGNED';
+  }
+
   await Promise.all([
     updateAmbulanceStatus(best.ambulanceId, 'BUSY'),
     Ambulance.findByIdAndUpdate(best.ambulanceId, {
       assignedSessionId: sessionId,
       status: 'BUSY',
     }),
-    EmergencySession.findByIdAndUpdate(sessionId, {
-      ambulanceId: best.ambulanceId,
-      status: 'ASSIGNED',
-      $push: {
-        eventLog: {
-          status: 'ASSIGNED',
-          timestamp: new Date(),
-          meta: {
-            ambulanceId: best.ambulanceId,
-            etaSeconds: best.etaSeconds,
-            distanceKm: best.distanceKm,
-            score: best.score,
-          },
-        },
-      },
-    }),
+    EmergencySession.findByIdAndUpdate(sessionId, sessionUpdate),
   ]);
   t.afterWrite = Date.now();
 

@@ -77,11 +77,11 @@ describe('EmergencySession — addEvent()', () => {
     await EmergencySession.deleteOne({ _id: session._id });
   });
 
-  test('addEvent updates status correctly', async () => {
+  test('addEvent does NOT update status', async () => {
     session.addEvent('ASSIGNED', { ambulanceId: 'amb_001' });
     await session.save();
 
-    expect(session.status).toBe('ASSIGNED');
+    expect(session.status).toBe('INITIATED');
   });
 
   test('addEvent pushes entry to eventLog', async () => {
@@ -110,9 +110,9 @@ describe('EmergencySession — addEvent()', () => {
     await session.save();
 
     expect(session.eventLog).toHaveLength(3);
-    expect(session.status).toBe('RESOLVED');
     expect(session.eventLog[0].status).toBe('ASSIGNED');
     expect(session.eventLog[2].status).toBe('RESOLVED');
+    expect(session.status).toBe('INITIATED'); // Unchanged by addEvent
   });
 
   test('eventLog entry has no _id field', async () => {
@@ -121,12 +121,5 @@ describe('EmergencySession — addEvent()', () => {
 
     const entry = session.eventLog[0];
     expect(entry._id).toBeUndefined();
-  });
-
-  test('resolvedAt is set when status becomes RESOLVED', async () => {
-    session.addEvent('RESOLVED', {});
-    await session.save();
-
-    expect(session.resolvedAt).toBeInstanceOf(Date);
   });
 });

@@ -1,22 +1,15 @@
-const Bull = require('bull');
+const { EventEmitter } = require('events');
+EventEmitter.defaultMaxListeners = 20;
+
+const { Queue, Worker, QueueEvents } = require('bullmq');
+const { getBullMQConnection } = require('../config/bullmq');
 const redis = require('../config/redis');
 const logger = require('../utils/logger');
 
-function parseRedisUrl(url) {
-  const parsed = new URL(url);
-  return {
-    host: parsed.hostname,
-    port: parseInt(parsed.port) || 6379,
-    password: parsed.password || undefined,
-    tls: url.startsWith('rediss://') ? {} : undefined,
-  };
-}
+const connection = getBullMQConnection();
 
-const redisConfig = parseRedisUrl(process.env.REDIS_URL);
-
-// Maps API queue — max 5 concurrent requests to respect rate limits
-const mapsQueue = new Bull('maps-requests', {
-  redis: redisConfig,
+const mapsQueue = new Queue('maps-requests', {
+  connection,
   defaultJobOptions: {
     attempts: 3,
     backoff: { type: 'exponential', delay: 1000 },
@@ -25,18 +18,14 @@ const mapsQueue = new Bull('maps-requests', {
   },
 });
 
-const CACHE_TTL = 300; // 5 minutes — traffic changes, so don't cache too long
+const mapsQueueEvents = new QueueEvents('maps-requests', { connection });
+
+const CACHE_TTL = 300; // 5 minutes
 
 /**
  * Get ETA with caching + queue rate limiting.
- * @param {number} fromLat
- * @param {number} fromLng
- * @param {number} toLat
- * @param {number} toLng
- * @returns {Promise<number>} ETA in minutes
  */
 async function getQueuedETA(fromLat, fromLng, toLat, toLng) {
-  // Round to 3 decimal places (~100m precision) for cache key
   const cacheKey = `maps:eta:${fromLat.toFixed(3)},${fromLng.toFixed(3)}:${toLat.toFixed(3)},${toLng.toFixed(3)}`;
 
   // Check cache first
@@ -46,38 +35,50 @@ async function getQueuedETA(fromLat, fromLng, toLat, toLng) {
     return parseInt(cached);
   }
 
-  // Add to queue — respects concurrency limit
+  // Add to queue
   const job = await mapsQueue.add(
+    'get-eta',
     { fromLat, fromLng, toLat, toLng, cacheKey },
     { priority: 1 }
   );
 
-  // Wait for result
-  const result = await job.finished();
+  // Wait for result with timeout
+  const result = await job.waitUntilFinished(mapsQueueEvents, 30000);
   return result;
 }
 
-// Process Maps API requests — max 5 concurrent
-mapsQueue.process(5, async (job) => {
-  const { fromLat, fromLng, toLat, toLng, cacheKey } = job.data;
+// Worker — max 5 concurrent Maps API requests
+const worker = new Worker(
+  'maps-requests',
+  async (job) => {
+    const { fromLat, fromLng, toLat, toLng, cacheKey } = job.data;
 
-  // Check cache again (might have been populated while waiting in queue)
-  const cached = await redis.get(cacheKey);
-  if (cached) return parseInt(cached);
+    // Check cache again (might be populated while in queue)
+    const cached = await redis.get(cacheKey);
+    if (cached) return parseInt(cached);
 
-  // Make the actual Maps API call
-  const { getSingleETA } = require('../services/mapsService');
-  const etaMinutes = await getSingleETA(fromLat, fromLng, toLat, toLng);
+    const { getSingleETA } = require('../services/mapsService');
+    const etaMinutes = await getSingleETA(fromLat, fromLng, toLat, toLng);
 
-  // Cache result
-  await redis.set(cacheKey, etaMinutes.toString(), 'EX', CACHE_TTL);
+    await redis.set(cacheKey, etaMinutes.toString(), 'EX', CACHE_TTL);
+    logger.debug(`Maps API: ${etaMinutes}min | cached ${CACHE_TTL}s`);
 
-  logger.debug(`Maps API call completed: ${etaMinutes}min | cached for ${CACHE_TTL}s`);
-  return etaMinutes;
+    return etaMinutes;
+  },
+  {
+    connection,
+    concurrency: 5,
+  }
+);
+
+worker.on('failed', (job, err) => {
+  logger.error(`Maps queue job failed: ${job?.id}`, err.message);
 });
 
-mapsQueue.on('failed', (job, err) => {
-  logger.error(`Maps queue job failed: ${job.id}`, err.message);
+worker.on('error', (err) => {
+  logger.error(`Maps worker error: ${err.message}`);
 });
+
+logger.info('Maps queue worker initialized');
 
 module.exports = { getQueuedETA, mapsQueue };

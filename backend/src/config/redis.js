@@ -1,3 +1,6 @@
+const EventEmitter = require('events');
+EventEmitter.defaultMaxListeners = 50;
+
 const Redis = require('ioredis');
 const logger = require('../utils/logger');
 

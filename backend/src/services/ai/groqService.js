@@ -23,7 +23,7 @@ const limiter = new Bottleneck({
  */
 async function callGroq(messages, options = {}) {
   const {
-    model = 'qwen/qwen3.6-27b',
+    model = 'llama-3.3-70b-versatile',
     temperature = 0.3,
     max_tokens = 500,
   } = options;

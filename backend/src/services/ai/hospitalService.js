@@ -22,8 +22,8 @@ async function selectHospital(patientLat, patientLng, triageResult, emergencyTyp
 
   // Enrich with distance — haversine is cheap, do it for all
   const enriched = hospitals.map(h => {
-    const hLat = h.location?.lat || h.location?.coordinates?.[1];
-    const hLng = h.location?.lng || h.location?.coordinates?.[0];
+    const hLat = h.location.lat;
+    const hLng = h.location.lng;
     return {
       id: h._id.toString(),
       name: h.name,

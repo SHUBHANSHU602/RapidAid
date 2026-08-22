@@ -12,8 +12,12 @@ const PORT = process.env.PORT || 5000;
 const startServer = async () => {
   await connectDB();
 
-  const count = await syncAmbulancesToRedis();
-  logger.info(`Synced ${count} ambulances to Redis`);
+  try {
+    const count = await syncAmbulancesToRedis();
+    logger.info(`Synced ${count} ambulances to Redis`);
+  } catch (err) {
+    logger.warn(`Failed to sync ambulances to Redis: ${err.message}`);
+  }
 
   // Create HTTP server from Express app
   const httpServer = http.createServer(app);
