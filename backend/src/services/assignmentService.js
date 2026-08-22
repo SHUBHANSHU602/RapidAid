@@ -7,7 +7,31 @@ const { updateAmbulanceStatus } = require('./ambulanceCache');
 const logger = require('../utils/logger');
 const { getIO } = require('../sockets/emergencyRoom');
 const AVAILABLE_SET_KEY = 'ambulance:available';
+const ngeohash = require('ngeohash');
 
+/**
+ * Get geohash zone for a location at precision 4 (city-zone level ~40km x 20km)
+ * Precision 4 gives large enough zones that a city fits in ~4-9 cells
+ * @param {number} lat
+ * @param {number} lng
+ * @returns {string} 4-char geohash
+ */
+function getCityZone(lat, lng) {
+  return ngeohash.encode(lat, lng, 4);
+}
+
+/**
+ * Get all geohash prefixes to search — zone + 8 neighbours
+ * Prevents edge case where ambulance is 10m away but in adjacent cell
+ * @param {number} lat
+ * @param {number} lng
+ * @returns {string[]} array of 9 geohash prefixes
+ */
+function getSearchZones(lat, lng) {
+  const center = getCityZone(lat, lng);
+  const neighbours = ngeohash.neighbors(center);
+  return [center, ...Object.values(neighbours)];
+}
 // ── Step 1: Get nearby candidates from Redis ──────────────────────────────
 async function getNearbyAvailableAmbulances(lat, lng, maxCandidates = 10) {
   const targetGeohash = ngeohash.encode(lat, lng, 7);
@@ -97,7 +121,24 @@ async function assignAmbulance(sessionId, patientLat, patientLng) {
   for (const doc of ambulanceDocs) {
     docMap[doc._id.toString()] = doc;
   }
+// After getting available ambulance IDs from Redis
+// Add zone-based pre-filter before scoring
 
+const searchZones = getSearchZones(lat, lng);
+
+// Filter candidates to only those in relevant zones
+// ambulance:{id}:zone stored in Redis when ambulance synced
+const zoneFilteredCandidates = await Promise.all(
+  candidates.map(async (candidate) => {
+    const ambulanceZone = await redis.get(`ambulance:${candidate._id}:zone`);
+    if (!ambulanceZone) return candidate; // include if no zone data
+    const isInZone = searchZones.some(zone => ambulanceZone.startsWith(zone));
+    return isInZone ? candidate : null;
+  })
+);
+
+const filteredCandidates = zoneFilteredCandidates.filter(Boolean);
+logger.debug(`Geo-partition: ${candidates.length} ambulances → ${filteredCandidates.length} in zone`);
   // Step 4: Score + pick winner
   const scored = top5.map((candidate, i) => {
     const doc = docMap[candidate.ambulanceId];

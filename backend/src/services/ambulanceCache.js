@@ -42,7 +42,11 @@ async function syncAmbulancesToRedis() {
         geohash,
       })
     );
-
+    // Inside the sync loop for each ambulance, add after setting location:
+if (amb.currentLocation?.lat && amb.currentLocation?.lng) {
+  const zone = ngeohash.encode(amb.currentLocation.lat, amb.currentLocation.lng, 4);
+  pipeline.set(`ambulance:${amb._id}:zone`, zone);
+}
     if (amb.status === 'AVAILABLE') {
       pipeline.sadd(AVAILABLE_SET_KEY, id);
     }
