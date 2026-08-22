@@ -1,0 +1,62 @@
+config:
+  target: "http://localhost:5000"
+  phases:
+    - duration: 30
+      arrivalRate: 2
+      name: "Warm up"
+    - duration: 60
+      arrivalRate: 10
+      name: "Ramp up"
+    - duration: 60
+      arrivalRate: 20
+      name: "Peak load — 20 emergencies per second"
+    - duration: 30
+      arrivalRate: 5
+      name: "Cool down"
+  defaults:
+    headers:
+      Content-Type: "application/json"
+
+scenarios:
+  - name: "Full emergency trigger flow"
+    weight: 70
+    flow:
+      - post:
+          url: "/api/v1/auth/login"
+          json:
+            email: "admin@rapidaid.com"
+            password: "admin123"
+          capture:
+            - json: "$.accessToken"
+              as: "token"
+      - post:
+          url: "/api/v1/emergency/trigger"
+          headers:
+            Authorization: "Bearer {{ token }}"
+          json:
+            lat: "{{ $randomNumber(25.28, 25.35) }}"
+            lng: "{{ $randomNumber(82.93, 83.01) }}"
+            emergencyType: "CARDIAC"
+            severityLevel: 4
+          capture:
+            - json: "$.data.sessionId"
+              as: "sessionId"
+      - get:
+          url: "/api/v1/emergency/{{ sessionId }}"
+          headers:
+            Authorization: "Bearer {{ token }}"
+
+  - name: "Auth only"
+    weight: 20
+    flow:
+      - post:
+          url: "/api/v1/auth/login"
+          json:
+            email: "admin@rapidaid.com"
+            password: "admin123"
+
+  - name: "Health check"
+    weight: 10
+    flow:
+      - get:
+          url: "/api/v1/health"

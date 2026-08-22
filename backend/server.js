@@ -5,7 +5,7 @@ const connectDB = require('./src/config/db');
 const logger = require('./src/utils/logger');
 const { syncAmbulancesToRedis } = require('./src/services/ambulanceCache');
 const { initSocket } = require('./src/sockets/emergencyRoom');
-
+require('./src/workers/mapsQueue.worker');
 require('./src/workers/delayDetection.worker');
 const PORT = process.env.PORT || 5000;
 
