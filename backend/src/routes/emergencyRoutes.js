@@ -13,7 +13,8 @@ const {
   getRouteToDestination,
   sendChatMessage,
   getChatHistory,
-  getDriverReplies
+  getDriverReplies,
+  cancelEmergency
 } = require('../controllers/emergencyController');
 
 router.use(protect); // All emergency routes require login
@@ -22,6 +23,7 @@ router.post('/trigger', validate(validateTrigger), triggerEmergency);
 router.get('/', getAllSessions);
 router.get('/:id', getSession);
 router.post('/:id/transition', transitionSession);
+router.post('/:id/cancel', cancelEmergency);
 
 // Missing routes
 router.post('/:id/arrive', confirmArrival);

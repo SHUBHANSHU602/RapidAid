@@ -1,21 +1,24 @@
-import React from 'react';
-import { Navigate, useLocation } from 'react-router-dom';
-import { useAuthStore } from '../../store/authStore';
-import { FullPageLoader } from '../ui/Spinner';
+import { Navigate, Outlet } from 'react-router-dom';
+import useAuthStore from '../../store/authStore';
+import Spinner from '../ui/Spinner';
 
-export const ProtectedRoute = ({ children }) => {
-  const { isAuthenticated, isLoading } = useAuthStore();
-  const location = useLocation();
+export default function ProtectedRoute() {
+  const { user, isLoading, accessToken } = useAuthStore();
 
   if (isLoading) {
-    return <FullPageLoader text="Authenticating session..." />;
+    return (
+      <div className="min-h-screen bg-bg-primary flex items-center justify-center">
+        <div className="text-center space-y-4">
+          <Spinner size="lg" />
+          <p className="text-text-muted text-sm">Loading...</p>
+        </div>
+      </div>
+    );
   }
 
-  if (!isAuthenticated) {
-    return <Navigate to="/login" state={{ from: location }} replace />;
+  if (!accessToken || !user) {
+    return <Navigate to="/login" replace />;
   }
 
-  return children;
-};
-
-export default ProtectedRoute;
+  return <Outlet />;
+}

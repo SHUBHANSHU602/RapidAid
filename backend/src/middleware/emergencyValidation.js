@@ -16,7 +16,7 @@ exports.validateTrigger = [
     ])
     .withMessage('Invalid emergency type'),
   body('severityLevel')
-    .notEmpty().withMessage('Severity level is required')
+    .optional()
     .isInt({ min: 1, max: 5 }).withMessage('Severity must be between 1 and 5'),
   body('description')
     .optional()

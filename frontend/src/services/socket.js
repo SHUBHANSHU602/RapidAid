@@ -1,107 +1,33 @@
 import { io } from 'socket.io-client';
 
-const SOCKET_SERVER_URL = import.meta.env.VITE_SOCKET_URL || 'http://localhost:5000';
+let socket = null;
 
-let socketInstance = null;
+export function connectSocket() {
+  const token = localStorage.getItem('accessToken');
+  if (socket?.connected) return socket;
 
-/**
- * Initializes and connects the singleton Socket.io client.
- * @param {string} token - JWT Access Token
- * @returns {Socket}
- */
-export const connectSocket = (token) => {
-  const authToken = token || localStorage.getItem('accessToken');
-
-  if (socketInstance) {
-    if (socketInstance.connected) {
-      return socketInstance;
-    }
-    socketInstance.auth = { token: authToken };
-    socketInstance.connect();
-    return socketInstance;
-  }
-
-  socketInstance = io(SOCKET_SERVER_URL, {
-    auth: {
-      token: authToken,
-    },
-    transports: ['websocket', 'polling'],
-    autoConnect: true,
+  socket = io(import.meta.env.VITE_SOCKET_URL || 'http://localhost:5000', {
+    auth: { token },
     reconnection: true,
-    reconnectionAttempts: Infinity,
+    reconnectionAttempts: 10,
     reconnectionDelay: 1000,
-    reconnectionDelayMax: 5000,
-    timeout: 20000,
   });
 
-  socketInstance.on('connect', () => {
-    console.log('[Socket] Connected with ID:', socketInstance.id);
-  });
+  socket.on('connect', () => console.log('Socket connected:', socket.id));
+  socket.on('disconnect', (reason) => console.log('Socket disconnected:', reason));
+  socket.on('connect_error', (err) => console.error('Socket error:', err.message));
 
-  socketInstance.on('disconnect', (reason) => {
-    console.log('[Socket] Disconnected:', reason);
-  });
+  return socket;
+}
 
-  socketInstance.on('connect_error', (error) => {
-    console.warn('[Socket] Connection error:', error.message);
-  });
+export function getSocket() {
+  if (!socket) return connectSocket();
+  return socket;
+}
 
-  return socketInstance;
-};
-
-/**
- * Gets the active socket instance or creates one.
- * @returns {Socket}
- */
-export const getSocket = () => {
-  if (!socketInstance) {
-    const token = localStorage.getItem('accessToken');
-    return connectSocket(token);
+export function disconnectSocket() {
+  if (socket) {
+    socket.disconnect();
+    socket = null;
   }
-  return socketInstance;
-};
-
-/**
- * Disconnects and destroys the socket instance.
- */
-export const disconnectSocket = () => {
-  if (socketInstance) {
-    socketInstance.disconnect();
-    socketInstance = null;
-    console.log('[Socket] Instance destroyed');
-  }
-};
-
-/**
- * Join an emergency session room as a patient.
- * @param {string} sessionId 
- */
-export const joinSession = (sessionId) => {
-  const socket = getSocket();
-  if (socket && sessionId) {
-    socket.emit('join_session', { sessionId });
-  }
-};
-
-/**
- * Join an emergency session room as a driver.
- * @param {string} sessionId 
- */
-export const joinAsDriver = (sessionId) => {
-  const socket = getSocket();
-  if (socket && sessionId) {
-    socket.emit('join_as_driver', { sessionId });
-  }
-};
-
-/**
- * Emit driver GPS location update.
- * @param {number} latitude 
- * @param {number} longitude 
- */
-export const emitLocationUpdate = (latitude, longitude) => {
-  const socket = getSocket();
-  if (socket && typeof latitude === 'number' && typeof longitude === 'number') {
-    socket.emit('location_update', { latitude, longitude });
-  }
-};
+}

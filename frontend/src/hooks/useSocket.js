@@ -1,24 +1,30 @@
-import { useEffect } from 'react';
+import { useEffect, useRef } from 'react';
 import { getSocket } from '../services/socket';
 
-/**
- * Custom hook to safely subscribe to Socket.io events with automatic cleanup on unmount.
- * @param {string} eventName - Socket event name
- * @param {Function} handler - Event callback handler
- */
-export const useSocket = (eventName, handler) => {
+export function useSocketEvent(event, handler, deps = []) {
+  const handlerRef = useRef(handler);
+  handlerRef.current = handler;
+
   useEffect(() => {
-    if (!eventName || !handler) return;
-
     const socket = getSocket();
-    if (!socket) return;
+    const fn = (...args) => handlerRef.current(...args);
+    socket.on(event, fn);
+    return () => socket.off(event, fn);
+  }, deps);
+}
 
-    socket.on(eventName, handler);
+export function useJoinSession(sessionId) {
+  useEffect(() => {
+    if (!sessionId) return;
+    const socket = getSocket();
+    socket.emit('join_session', { sessionId });
+  }, [sessionId]);
+}
 
-    return () => {
-      socket.off(eventName, handler);
-    };
-  }, [eventName, handler]);
-};
-
-export default useSocket;
+export function useJoinAsDriver(sessionId) {
+  useEffect(() => {
+    if (!sessionId) return;
+    const socket = getSocket();
+    socket.emit('join_as_driver', { sessionId });
+  }, [sessionId]);
+}

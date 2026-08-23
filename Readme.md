@@ -174,52 +174,56 @@ rapidaid/
 │   │   │
 │   │   ├── config/
 │   │   │   ├── db.js                  # Mongoose connection with retry logic
-│   │   │   └── redis.js               # ioredis client with reconnect strategy
+│   │   │   ├── redis.js               # ioredis client with reconnect strategy
+│   │   │   └── bullmq.js              # BullMQ queue configuration
 │   │   │
 │   │   ├── models/
-│   │   │   ├── user.model.js          # User schema (bcrypt pre-save hook)
-│   │   │   ├── emergency.model.js     # Session schema + eventLog + state enum
-│   │   │   ├── ambulance.model.js     # GeoJSON location + availability state
-│   │   │   ├── hospital.model.js      # Capacity, specializations, GeoJSON
-│   │   │   └── message.model.js       # Driver-patient chat messages
+│   │   │   ├── User.js                # User schema (bcrypt pre-save hook)
+│   │   │   ├── EmergencySession.js    # Session schema + eventLog + state enum
+│   │   │   ├── Ambulance.js           # GeoJSON location + availability state
+│   │   │   └── Hospital.js            # Capacity, specializations, GeoJSON
 │   │   │
 │   │   ├── routes/
-│   │   │   ├── auth.routes.js         # POST /register, /login, /refresh, /logout
-│   │   │   ├── emergency.routes.js    # POST /trigger, GET /:id, PATCH /:id/status
-│   │   │   ├── ambulance.routes.js    # CRUD + availability + location update
-│   │   │   └── hospital.routes.js     # CRUD + bed availability update
+│   │   │   ├── authRoutes.js          # POST /register, /login
+│   │   │   ├── emergencyRoutes.js     # POST /trigger, GET /:id, PATCH /:id/status
+│   │   │   ├── ambulanceRoutes.js     # CRUD + availability + location update
+│   │   │   ├── hospitalRoutes.js      # CRUD + bed availability update
+│   │   │   └── analyticsRoutes.js     # Admin dashboard analytics
 │   │   │
 │   │   ├── controllers/
-│   │   │   ├── auth.controller.js     # Register, login, token refresh logic
-│   │   │   ├── emergency.controller.js# Trigger flow, session fetch, status patch
-│   │   │   ├── ambulance.controller.js# Availability management, location ping
-│   │   │   └── hospital.controller.js # Hospital CRUD, capacity management
+│   │   │   ├── authController.js      # Register, login, token refresh logic
+│   │   │   ├── emergencyController.js # Trigger flow, session fetch, status patch
+│   │   │   ├── ambulanceController.js # Availability management, location ping
+│   │   │   └── analyticsController.js # Dashboard metrics logic
 │   │   │
 │   │   ├── services/
-│   │   │   ├── assignment.service.js  # Weighted ambulance scoring algorithm
-│   │   │   ├── delay.service.js       # ETA drift calculation + fallback trigger
-│   │   │   ├── fallback.service.js    # 4-level fallback orchestration
-│   │   │   ├── ai.service.js          # Groq API — triage, hospital select, suggestions
-│   │   │   └── maps.service.js        # Google Maps ETA, routing, geocoding
+│   │   │   ├── ambulanceCache.js      # Redis cache for ambulance locations
+│   │   │   ├── assignmentService.js   # Weighted ambulance scoring algorithm
+│   │   │   ├── fallbackService.js     # 4-level fallback orchestration
+│   │   │   ├── mapsService.js         # Google Maps ETA, routing, geocoding
+│   │   │   └── ai/                    # Groq API + LangChain logic
+│   │   │       ├── triageService.js       # AI severity classification
+│   │   │       ├── firstAidService.js     # Contextual first-aid generation
+│   │   │       ├── hospitalService.js     # AI hospital matching
+│   │   │       └── driverAssistService.js # AI driver quick-replies
 │   │   │
 │   │   ├── workers/
-│   │   │   └── delayDetection.worker.js  # Bull job — runs every 60s per active session
+│   │   │   ├── delayDetection.worker.js  # BullMQ job — runs every 60s per active session
+│   │   │   └── mapsQueue.worker.js       # BullMQ job for async maps operations
 │   │   │
 │   │   ├── sockets/
-│   │   │   ├── index.js               # Socket.io init + Redis adapter setup
-│   │   │   ├── emergencyRoom.js       # Room join/leave, location broadcast, chat
-│   │   │   └── events.js              # Event name constants
+│   │   │   └── emergencyRoom.js       # Socket.io init + Redis adapter + Room logic
 │   │   │
 │   │   ├── middleware/
-│   │   │   ├── auth.middleware.js     # JWT verify + req.user injection
-│   │   │   ├── role.middleware.js     # Role-based access (USER / DRIVER / ADMIN)
-│   │   │   ├── rateLimit.middleware.js# Per-route rate limiters
-│   │   │   └── error.middleware.js    # Centralized error handler
+│   │   │   ├── auth.js                # JWT verify + req.user injection
+│   │   │   ├── validate.js            # Request schema validation
+│   │   │   ├── requestLogger.js       # Request logging
+│   │   │   └── emergencyValidation.js # Validation for emergency endpoints
 │   │   │
 │   │   ├── utils/
 │   │   │   ├── logger.js              # Winston logger (debug in dev, info in prod)
-│   │   │   ├── apiError.js            # Custom error class with statusCode
-│   │   │   └── geohash.js             # Geohash utilities for zone partitioning
+│   │   │   ├── AppError.js            # Custom error class with statusCode
+│   │   │   └── redis.js               # Redis utilities
 │   │   │
 │   │   ├── app.js                     # Express setup — middleware stack, routes
 │   │   └── server.js                  # HTTP server + Socket.io + connectDB entry
@@ -231,22 +235,46 @@ rapidaid/
 └── frontend/
     ├── src/
     │   ├── components/
-    │   │   ├── Map/                   # Mapbox GL wrapper + live marker updates
-    │   │   ├── EmergencyTrigger/      # One-button trigger + severity description
-    │   │   ├── TrackingPanel/         # ETA, driver info, status updates
-    │   │   ├── Chat/                  # Real-time patient-driver chat
-    │   │   └── FallbackAlert/         # AI fallback suggestion display
+    │   │   ├── features/              # Feature-specific components
+    │   │   │   ├── chat/ChatPanel.jsx
+    │   │   │   ├── driver/LocationEmitter.jsx
+    │   │   │   └── emergency/TriggerModal.jsx
+    │   │   ├── layout/                # App shell (Navbar, Routes)
+    │   │   │   ├── Navbar.jsx
+    │   │   │   ├── ProtectedRoute.jsx
+    │   │   │   └── RoleRoute.jsx
+    │   │   ├── map/                   # Map components
+    │   │   │   └── TrackingMap.jsx
+    │   │   └── ui/                    # Reusable generic UI components
+    │   │       ├── Badge.jsx, Button.jsx, Card.jsx, Modal.jsx, etc.
     │   │
     │   ├── hooks/
-    │   │   ├── useSocket.js           # Socket.io connection lifecycle
-    │   │   ├── useLocation.js         # Browser geolocation with error handling
-    │   │   └── useEmergency.js        # Session state management
+    │   │   ├── useAuth.js             # Authentication hook
+    │   │   ├── useGeolocation.js      # Browser geolocation with error handling
+    │   │   └── useSocket.js           # Socket.io connection lifecycle
+    │   │
+    │   ├── pages/                     # Main page views
+    │   │   ├── Landing.jsx, Login.jsx, Register.jsx
+    │   │   ├── PatientDashboard.jsx, DriverDashboard.jsx
+    │   │   ├── AdminDashboard.jsx, EmergencyTracking.jsx
     │   │
     │   ├── services/
-    │   │   └── api.js                 # Axios instance with JWT interceptors
+    │   │   ├── api.js                 # Axios instance with interceptors
+    │   │   └── socket.js              # Socket.io client configuration
     │   │
     │   ├── store/                     # Zustand global state
-    │   └── main.jsx
+    │   │   ├── authStore.js
+    │   │   ├── driverStore.js
+    │   │   └── sessionStore.js
+    │   │
+    │   ├── utils/
+    │   │   ├── geo.js                 # Geo utilities
+    │   │   ├── jwt.js                 # Token utilities
+    │   │   └── time.js                # Time formatting
+    │   │
+    │   ├── App.jsx
+    │   ├── main.jsx
+    │   └── index.css
     │
     ├── .env.example
     └── package.json

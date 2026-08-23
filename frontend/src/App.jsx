@@ -1,5 +1,9 @@
-import React, { useEffect } from 'react';
-import { BrowserRouter as Router, Routes, Route, Navigate } from 'react-router-dom';
+import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
+import { useEffect } from 'react';
+import useAuthStore from './store/authStore';
+import { connectSocket } from './services/socket';
+import ToastProvider from './components/ui/Toast';
+
 import Landing from './pages/Landing';
 import Login from './pages/Login';
 import Register from './pages/Register';
@@ -7,84 +11,47 @@ import PatientDashboard from './pages/PatientDashboard';
 import EmergencyTracking from './pages/EmergencyTracking';
 import DriverDashboard from './pages/DriverDashboard';
 import AdminDashboard from './pages/AdminDashboard';
+
 import ProtectedRoute from './components/layout/ProtectedRoute';
 import RoleRoute from './components/layout/RoleRoute';
-import ToastProvider from './components/ui/Toast';
-import ErrorBoundary from './components/layout/ErrorBoundary';
-import { useAuthStore } from './store/authStore';
-import { useSocketStore } from './store/socketStore';
 
-export const App = () => {
-  const { loadUser, accessToken } = useAuthStore();
-  const { initSocketListeners } = useSocketStore();
+function App() {
+  const loadUser = useAuthStore((s) => s.loadUser);
 
   useEffect(() => {
     loadUser();
-    initSocketListeners();
-  }, [loadUser, initSocketListeners]);
+    if (localStorage.getItem('accessToken')) {
+      connectSocket();
+    }
+  }, [loadUser]);
 
   return (
-    <ErrorBoundary>
-      <Router>
-        <ToastProvider />
-        <Routes>
-          {/* Public Routes */}
-          <Route path="/" element={<Landing />} />
-          <Route path="/login" element={<Login />} />
-          <Route path="/register" element={<Register />} />
+    <BrowserRouter>
+      <ToastProvider />
+      <Routes>
+        <Route path="/" element={<Landing />} />
+        <Route path="/login" element={<Login />} />
+        <Route path="/register" element={<Register />} />
 
-          {/* Patient Routes (USER) */}
-          <Route
-            path="/dashboard"
-            element={
-              <ProtectedRoute>
-                <RoleRoute allowedRoles={['USER', 'ADMIN']}>
-                  <PatientDashboard />
-                </RoleRoute>
-              </ProtectedRoute>
-            }
-          />
+        <Route element={<ProtectedRoute />}>
+          <Route element={<RoleRoute allowedRoles={['USER']} />}>
+            <Route path="/dashboard" element={<PatientDashboard />} />
+            <Route path="/emergency/:id" element={<EmergencyTracking />} />
+          </Route>
 
-          {/* Active Emergency Tracking (USER, DRIVER, ADMIN) */}
-          <Route
-            path="/emergency/:id"
-            element={
-              <ProtectedRoute>
-                <EmergencyTracking />
-              </ProtectedRoute>
-            }
-          />
+          <Route element={<RoleRoute allowedRoles={['DRIVER']} />}>
+            <Route path="/driver" element={<DriverDashboard />} />
+          </Route>
 
-          {/* Driver Dashboard (DRIVER) */}
-          <Route
-            path="/driver"
-            element={
-              <ProtectedRoute>
-                <RoleRoute allowedRoles={['DRIVER', 'ADMIN']}>
-                  <DriverDashboard />
-                </RoleRoute>
-              </ProtectedRoute>
-            }
-          />
+          <Route element={<RoleRoute allowedRoles={['ADMIN']} />}>
+            <Route path="/admin" element={<AdminDashboard />} />
+          </Route>
+        </Route>
 
-          {/* Admin Control Center (ADMIN) */}
-          <Route
-            path="/admin"
-            element={
-              <ProtectedRoute>
-                <RoleRoute allowedRoles={['ADMIN']}>
-                  <AdminDashboard />
-                </RoleRoute>
-              </ProtectedRoute>
-            }
-          />
-
-          {/* Fallback Catch-All */}
-          <Route path="*" element={<Navigate to="/" replace />} />
-        </Routes>
-      </Router>
-    </ErrorBoundary>
+        <Route path="*" element={<Navigate to="/" />} />
+      </Routes>
+    </BrowserRouter>
   );
-};
+}
 
 export default App;

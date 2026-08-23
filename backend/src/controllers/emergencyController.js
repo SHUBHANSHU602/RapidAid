@@ -29,7 +29,21 @@ function generateOTP() {
 // ── POST /api/v1/emergency/trigger ───────────────────────────────────────────
 exports.triggerEmergency = async (req, res, next) => {
   try {
-    const { lat, lng, emergencyType, severityLevel, description = '' } = req.body;
+    const { lat, lng, emergencyType, description = '' } = req.body;
+    const severityLevel = req.body.severityLevel || 3; // default to 3 if not provided
+
+    // ── FIX 5: Block multiple active emergencies ──────────────────────────
+    const activeSession = await EmergencySession.findOne({
+      userId: req.user.userId,
+      status: { $in: ['INITIATED', 'ASSIGNED', 'EN_ROUTE', 'DELAYED'] },
+    });
+
+    if (activeSession) {
+      return next(new AppError(
+        'You already have an active emergency. Please cancel or wait for it to resolve before starting a new one.',
+        409
+      ));
+    }
 
     // Step 1: General first aid — instant, hardcoded, no AI needed
     const generalFirstAid = getGeneralFirstAid(emergencyType);
@@ -271,6 +285,71 @@ exports.transitionSession = async (req, res, next) => {
     });
 
     res.status(200).json({ success: true, data: session });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// ── POST /api/v1/emergency/:id/cancel ────────────────────────────────────────
+exports.cancelEmergency = async (req, res, next) => {
+  try {
+    const session = await EmergencySession.findById(req.params.id);
+    if (!session) return next(new AppError('Session not found', 404));
+
+    const isOwner = session.userId.toString() === req.user.userId.toString();
+    const isAdmin = req.user.role.toLowerCase() === 'admin';
+    if (!isOwner && !isAdmin) return next(new AppError('Not authorized', 403));
+
+    if (['RESOLVED', 'CANCELLED'].includes(session.status)) {
+      return next(new AppError(`Session is already ${session.status}`, 400));
+    }
+
+    const previousStatus = session.status;
+    session.status = 'CANCELLED';
+    session.addEvent('CANCELLED', {
+      previousStatus,
+      cancelledBy: req.user.userId,
+      cancelledAt: new Date().toISOString(),
+    });
+    await session.save();
+
+    // Free ambulance if assigned
+    if (session.ambulanceId) {
+      try {
+        await updateAmbulanceStatus(session.ambulanceId.toString(), 'AVAILABLE');
+        await Ambulance.findByIdAndUpdate(session.ambulanceId, {
+          status: 'AVAILABLE',
+          assignedSessionId: null,
+        });
+      } catch (e) {
+        logger.warn('Cancel: failed to free ambulance', e.message);
+      }
+    }
+
+    // Cancel delay detection
+    try {
+      await cancelDelayDetection(session._id.toString());
+    } catch (e) {
+      logger.warn('Cancel: failed to cancel delay detection', e.message);
+    }
+
+    // Emit cancellation to session room
+    try {
+      emitToRoom(`session:${session._id}`, 'session_status_changed', {
+        sessionId: session._id,
+        previousStatus,
+        newStatus: 'CANCELLED',
+        changedAt: new Date().toISOString(),
+      });
+    } catch (e) {
+      logger.warn('Cancel: socket emit failed', e.message);
+    }
+
+    res.status(200).json({
+      success: true,
+      message: 'Emergency cancelled successfully',
+      data: session,
+    });
   } catch (err) {
     next(err);
   }

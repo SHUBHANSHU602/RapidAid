@@ -1,25 +1,22 @@
-import { useAuthStore } from '../store/authStore';
+import { useEffect } from 'react';
+import { useNavigate } from 'react-router-dom';
+import useAuthStore from '../store/authStore';
 
-export const useAuth = () => {
-  const { user, role, isAuthenticated, isLoading, error, login, register, logout } = useAuthStore();
+export function useAuth(requiredRole = null) {
+  const { user, isLoading } = useAuthStore();
+  const navigate = useNavigate();
 
-  const isUser = role === 'USER';
-  const isDriver = role === 'DRIVER';
-  const isAdmin = role === 'ADMIN';
+  useEffect(() => {
+    if (isLoading) return;
+    if (!user) {
+      navigate('/login');
+      return;
+    }
+    if (requiredRole && user.role?.toUpperCase() !== requiredRole.toUpperCase()) {
+      const roleRoutes = { USER: '/dashboard', DRIVER: '/driver', ADMIN: '/admin' };
+      navigate(roleRoutes[user.role?.toUpperCase()] || '/');
+    }
+  }, [user, isLoading, requiredRole, navigate]);
 
-  return {
-    user,
-    role,
-    isAuthenticated,
-    isLoading,
-    error,
-    isUser,
-    isDriver,
-    isAdmin,
-    login,
-    register,
-    logout,
-  };
-};
-
-export default useAuth;
+  return { user, isLoading };
+}
