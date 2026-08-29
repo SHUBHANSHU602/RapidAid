@@ -3,226 +3,179 @@ const redis = require('../config/redis');
 const Ambulance = require('../models/Ambulance');
 const EmergencySession = require('../models/EmergencySession');
 const { haversineDistance, getETAs } = require('./mapsService');
-const { updateAmbulanceStatus } = require('./ambulanceCache');
 const logger = require('../utils/logger');
 const { getIO } = require('../sockets/emergencyRoom');
+
 const AVAILABLE_SET_KEY = 'ambulance:available';
 
-/**
- * Get geohash zone for a location at precision 4 (city-zone level ~40km x 20km)
- * Precision 4 gives large enough zones that a city fits in ~4-9 cells
- * @param {number} lat
- * @param {number} lng
- * @returns {string} 4-char geohash
- */
-function getCityZone(lat, lng) {
-  return ngeohash.encode(lat, lng, 4);
-}
-
-/**
- * Get all geohash prefixes to search — zone + 8 neighbours
- * Prevents edge case where ambulance is 10m away but in adjacent cell
- * @param {number} lat
- * @param {number} lng
- * @returns {string[]} array of 9 geohash prefixes
- */
-function getSearchZones(lat, lng) {
-  const center = getCityZone(lat, lng);
-  const neighbours = ngeohash.neighbors(center);
-  return [center, ...Object.values(neighbours)];
-}
-// ── Step 1: Get nearby candidates from Redis ──────────────────────────────
 async function getNearbyAvailableAmbulances(lat, lng, maxCandidates = 10) {
-  const targetGeohash = ngeohash.encode(lat, lng, 7);
-
-  const neighbours = ngeohash.neighbors(targetGeohash);
-  const searchPrefixes = [
-    targetGeohash.slice(0, 5),
-    ...Object.values(neighbours).map((n) => n.slice(0, 5)),
-  ];
-  const uniquePrefixes = [...new Set(searchPrefixes)];
+  const target = ngeohash.encode(lat, lng, 7);
+  const neighbours = ngeohash.neighbors(target);
+  const prefixes = [target.slice(0, 5), ...Object.values(neighbours).map((n) => n.slice(0, 5))];
+  const uniquePrefixes = [...new Set(prefixes)];
 
   const availableIds = await redis.smembers(AVAILABLE_SET_KEY);
-  if (availableIds.length === 0) return [];
+  if (!availableIds.length) return [];
 
   const pipeline = redis.pipeline();
-  for (const id of availableIds) {
-    pipeline.get(`ambulance:${id}:location`);
-  }
+  for (const id of availableIds) pipeline.get(`ambulance:${id}:location`);
   const results = await pipeline.exec();
 
-  const nearby = [];
+  const candidates = [];
   for (let i = 0; i < availableIds.length; i++) {
-    const raw = results[i][1];
+    const raw = results[i]?.[1];
     if (!raw) continue;
-
     const location = JSON.parse(raw);
-    const ambulancePrefix = location.geohash.slice(0, 5);
+    const aLat = location.lat ?? location.latitude;
+    const aLng = location.lng ?? location.longitude;
+    if (!Number.isFinite(aLat) || !Number.isFinite(aLng)) continue;
 
-    if (uniquePrefixes.includes(ambulancePrefix)) {
-      nearby.push({
-        ambulanceId: availableIds[i],
-        lat: location.lat,
-        lng: location.lng,
-      });
-    }
+    const geohash = location.geohash || ngeohash.encode(aLat, aLng, 7);
+    if (!uniquePrefixes.some((prefix) => geohash.startsWith(prefix))) continue;
+
+    candidates.push({
+      ambulanceId: availableIds[i],
+      lat: aLat,
+      lng: aLng,
+      distanceKm: haversineDistance(lat, lng, aLat, aLng),
+    });
   }
 
-  return nearby
-    .map((a) => ({
-      ...a,
-      distanceKm: haversineDistance(lat, lng, a.lat, a.lng),
-    }))
-    .sort((a, b) => a.distanceKm - b.distanceKm)
-    .slice(0, maxCandidates);
+  return candidates.sort((a, b) => a.distanceKm - b.distanceKm).slice(0, maxCandidates);
 }
 
-// ── Step 2: Score candidates ──────────────────────────────────────────────
 function scoreCandidate(etaSeconds, distanceKm, lastPingMs) {
   const etaScore = Math.min(etaSeconds / 600, 1);
   const distScore = Math.min(distanceKm / 10, 1);
-  const pingAge = (Date.now() - lastPingMs) / (1000 * 60 * 30);
-  const pingScore = Math.min(pingAge, 1);
-
+  const pingAge = lastPingMs ? (Date.now() - lastPingMs) / (1000 * 60 * 30) : 1;
+  const pingScore = Math.min(Math.max(pingAge, 0), 1);
   return etaScore * 0.5 + distScore * 0.3 + pingScore * 0.2;
 }
 
-// ── Main assignment function ──────────────────────────────────────────────
+async function reserveAmbulance(ambulanceId) {
+  const id = ambulanceId.toString();
+  const lua = `
+    local status = redis.call('GET', KEYS[1])
+    if status ~= 'AVAILABLE' then return 0 end
+    if redis.call('SISMEMBER', KEYS[2], ARGV[1]) == 0 then return 0 end
+    redis.call('SET', KEYS[1], 'BUSY')
+    redis.call('SREM', KEYS[2], ARGV[1])
+    return 1
+  `;
+  const result = await redis.eval(lua, 2, `ambulance:${id}:status`, AVAILABLE_SET_KEY, id);
+  return result === 1;
+}
+
+async function releaseReservation(ambulanceId) {
+  const id = ambulanceId.toString();
+  const pipeline = redis.pipeline();
+  pipeline.set(`ambulance:${id}:status`, 'AVAILABLE');
+  pipeline.sadd(AVAILABLE_SET_KEY, id);
+  await pipeline.exec();
+}
+
 async function assignAmbulance(sessionId, patientLat, patientLng) {
-  const t = { start: Date.now() };
-
-  // Step 1: Redis candidate fetch
+  const startedAt = Date.now();
   const candidates = await getNearbyAvailableAmbulances(patientLat, patientLng, 10);
-  t.afterRedis = Date.now();
-
-  if (candidates.length === 0) {
+  if (!candidates.length) {
     logger.warn(`No available ambulances near ${patientLat},${patientLng}`);
     return null;
   }
 
   const top5 = candidates.slice(0, 5);
-
-  // Step 2: ETA + MongoDB fetch in parallel
   const [etaSeconds, ambulanceDocs] = await Promise.all([
     getETAs(
       { lat: patientLat, lng: patientLng },
       top5.map((a) => ({ lat: a.lat, lng: a.lng }))
     ),
-    Ambulance.find({
-      _id: { $in: top5.map((a) => a.ambulanceId) },
-    }).lean(),
+    Ambulance.find({ _id: { $in: top5.map((a) => a.ambulanceId) } }).lean(),
   ]);
-  t.afterETA = Date.now();
-  t.afterMongo = t.afterETA; // parallel — same moment
 
-  // Step 3: Build doc map
-  const docMap = {};
-  for (const doc of ambulanceDocs) {
-    docMap[doc._id.toString()] = doc;
-  }
-// After getting available ambulance IDs from Redis
-// Add zone-based pre-filter before scoring
-
-const searchZones = getSearchZones(patientLat, patientLng);
-
-// Filter candidates to only those in relevant zones
-// ambulance:{id}:zone stored in Redis when ambulance synced
-const zoneFilteredCandidates = await Promise.all(
-  candidates.map(async (candidate) => {
-    const ambulanceZone = await redis.get(`ambulance:${candidate._id}:zone`);
-    if (!ambulanceZone) return candidate; // include if no zone data
-    const isInZone = searchZones.some(zone => ambulanceZone.startsWith(zone));
-    return isInZone ? candidate : null;
-  })
-);
-
-const filteredCandidates = zoneFilteredCandidates.filter(Boolean);
-logger.debug(`Geo-partition: ${candidates.length} ambulances → ${filteredCandidates.length} in zone`);
-  // Step 4: Score + pick winner
-  const scored = top5.map((candidate, i) => {
+  const docMap = Object.fromEntries(ambulanceDocs.map((doc) => [doc._id.toString(), doc]));
+  const scored = top5.map((candidate, index) => {
     const doc = docMap[candidate.ambulanceId];
     const lastPingMs = doc?.lastPing ? new Date(doc.lastPing).getTime() : 0;
     return {
       ...candidate,
-      etaSeconds: etaSeconds[i],
-      score: scoreCandidate(etaSeconds[i], candidate.distanceKm, lastPingMs),
+      etaSeconds: etaSeconds[index],
+      score: scoreCandidate(etaSeconds[index], candidate.distanceKm, lastPingMs),
     };
-  });
-  scored.sort((a, b) => a.score - b.score);
-  const best = scored[0];
-  t.afterScoring = Date.now();
+  }).sort((a, b) => a.score - b.score);
 
-  // Step 5: All writes in parallel
-  const currentSession = await EmergencySession.findById(sessionId);
-  if (currentSession && ['RESOLVED', 'CANCELLED'].includes(currentSession.status)) {
-    await updateAmbulanceStatus(best.ambulanceId, 'AVAILABLE');
+  let best = null;
+  for (const candidate of scored) {
+    if (await reserveAmbulance(candidate.ambulanceId)) {
+      best = candidate;
+      break;
+    }
+  }
+
+  if (!best) {
+    logger.warn(`Assignment race: all candidates were reserved before session ${sessionId} could claim one`);
     return null;
   }
 
-  const sessionUpdate = {
-    ambulanceId: best.ambulanceId,
-    $push: {
-      eventLog: {
-        status: 'ASSIGNED',
-        timestamp: new Date(),
-        meta: {
-          ambulanceId: best.ambulanceId,
-          etaSeconds: best.etaSeconds,
-          distanceKm: best.distanceKm,
-          score: best.score,
-        },
-      },
-    },
-  };
-  if (currentSession && currentSession.status === 'INITIATED') {
-    sessionUpdate.status = 'ASSIGNED';
-  }
-
-  await Promise.all([
-    updateAmbulanceStatus(best.ambulanceId, 'BUSY'),
-    Ambulance.findByIdAndUpdate(best.ambulanceId, {
-      assignedSessionId: sessionId,
-      status: 'BUSY',
-    }),
-    EmergencySession.findByIdAndUpdate(sessionId, sessionUpdate),
-  ]);
-  t.afterWrite = Date.now();
-
   try {
-  const io = getIO();
-  io.to(`session:${sessionId}`).emit('ambulance_assigned', {
-    sessionId,
-    ambulanceId: best.ambulanceId,
-    etaSeconds: best.etaSeconds,
-    distanceKm: best.distanceKm,
-    message: `Ambulance assigned — arriving in approximately ${Math.round(best.etaSeconds / 60)} minutes`,
-  });
-  logger.info(`Emitted ambulance_assigned to session:${sessionId}`);
-} catch (err) {
-  // Don't crash assignment if socket emit fails
-  logger.warn(`Socket emit failed: ${err.message}`);
-}
+    const session = await EmergencySession.findById(sessionId);
+    if (!session || ['RESOLVED', 'CANCELLED'].includes(session.status)) {
+      await releaseReservation(best.ambulanceId);
+      return null;
+    }
 
-  // Latency breakdown
-  const breakdown = {
-    redis: t.afterRedis - t.start,
-    eta: t.afterETA - t.afterRedis,
-    mongo: t.afterMongo - t.afterETA,
-    scoring: t.afterScoring - t.afterMongo,
-    write: t.afterWrite - t.afterScoring,
-    total: t.afterWrite - t.start,
-  };
+    const ambulanceDoc = docMap[best.ambulanceId] || await Ambulance.findById(best.ambulanceId).lean();
+    session.ambulanceId = best.ambulanceId;
+    if (session.status === 'INITIATED') session.status = 'ASSIGNED';
+    session.addEvent('ASSIGNED', {
+      ambulanceId: best.ambulanceId,
+      etaSeconds: best.etaSeconds,
+      distanceKm: best.distanceKm,
+      score: best.score,
+    });
 
-  logger.info(`Assignment complete in ${breakdown.total}ms`, breakdown);
+    await Promise.all([
+      session.save(),
+      Ambulance.findByIdAndUpdate(best.ambulanceId, {
+        assignedSessionId: sessionId,
+        status: 'BUSY',
+      }),
+    ]);
 
-  return {
-    ambulanceId: best.ambulanceId,
-    etaSeconds: best.etaSeconds,
-    distanceKm: best.distanceKm,
-    score: best.score,
-    latency: breakdown.total,
-    breakdown,
-  };
+    const io = getIO();
+    const patientPayload = {
+      sessionId,
+      ambulanceId: best.ambulanceId,
+      driverName: ambulanceDoc?.driverName,
+      vehicleNumber: ambulanceDoc?.vehicleNumber,
+      etaSeconds: best.etaSeconds,
+      etaMinutes: Math.ceil(best.etaSeconds / 60),
+      distanceKm: best.distanceKm,
+    };
+
+    io.to(`session:${sessionId}`).emit('ambulance_assigned', patientPayload);
+
+    if (ambulanceDoc?.driverId) {
+      io.to(`driver:${ambulanceDoc.driverId.toString()}`).emit('driver_assignment', {
+        sessionId,
+        emergencyType: session.emergencyType,
+        severityLevel: session.severityLevel,
+        patientLocation: session.location,
+        description: session.description,
+        etaMinutes: Math.ceil(best.etaSeconds / 60),
+      });
+    }
+
+    logger.info(`Assignment complete in ${Date.now() - startedAt}ms | ambulance=${best.ambulanceId}`);
+    return {
+      ambulanceId: best.ambulanceId,
+      etaSeconds: best.etaSeconds,
+      distanceKm: best.distanceKm,
+      score: best.score,
+      latency: Date.now() - startedAt,
+    };
+  } catch (err) {
+    await releaseReservation(best.ambulanceId).catch(() => {});
+    throw err;
+  }
 }
 
 module.exports = { assignAmbulance, getNearbyAvailableAmbulances };
