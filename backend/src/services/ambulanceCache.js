@@ -1,52 +1,35 @@
-/**
- * Syncs all ambulance documents from MongoDB to Redis on server boot.
- * Uses pipeline to batch all writes in a single round trip.
- * Key structure:
- *   ambulance:{id}:status   → AVAILABLE | BUSY | OFFLINE
- *   ambulance:{id}:location → JSON { lat, lng, geohash }
- *   ambulance:available     → Redis Set of available IDs
- *
- * @returns {Promise<number>} Count of ambulances synced
- */
 const redis = require('../config/redis');
 const Ambulance = require('../models/Ambulance');
 const ngeohash = require('ngeohash');
 
-// Key patterns:
-// ambulance:{id}:status  → AVAILABLE | BUSY | OFFLINE
-// ambulance:{id}:location → JSON { lat, lng, geohash }
-// ambulance:available    → Redis Set of all available ambulance IDs
-
 const AVAILABLE_SET_KEY = 'ambulance:available';
 
-// ── Sync all ambulances from MongoDB → Redis on boot ──────────────────────
+function buildLocationPayload(lat, lng) {
+  return {
+    lat,
+    lng,
+    latitude: lat,
+    longitude: lng,
+    geohash: ngeohash.encode(lat, lng, 7),
+    updatedAt: new Date().toISOString(),
+  };
+}
+
 async function syncAmbulancesToRedis() {
   const ambulances = await Ambulance.find({}).lean();
-
   const pipeline = redis.pipeline();
+
+  pipeline.del(AVAILABLE_SET_KEY);
 
   for (const amb of ambulances) {
     const id = amb._id.toString();
-    const geohash = ngeohash.encode(
-      amb.currentLocation.lat,
-      amb.currentLocation.lng,
-      7 // 7-char geohash = ~150m precision
-    );
+    const { lat, lng } = amb.currentLocation;
+    const location = buildLocationPayload(lat, lng);
 
     pipeline.set(`ambulance:${id}:status`, amb.status);
-    pipeline.set(
-      `ambulance:${id}:location`,
-      JSON.stringify({
-        latitude: amb.currentLocation.lat,
-        longitude: amb.currentLocation.lng,
-        geohash,
-      })
-    );
-    // Inside the sync loop for each ambulance, add after setting location:
-if (amb.currentLocation?.lat && amb.currentLocation?.lng) {
-  const zone = ngeohash.encode(amb.currentLocation.lat, amb.currentLocation.lng, 4);
-  pipeline.set(`ambulance:${amb._id}:zone`, zone);
-}
+    pipeline.set(`ambulance:${id}:location`, JSON.stringify(location));
+    pipeline.set(`ambulance:${id}:zone`, ngeohash.encode(lat, lng, 4));
+
     if (amb.status === 'AVAILABLE') {
       pipeline.sadd(AVAILABLE_SET_KEY, id);
     }
@@ -56,53 +39,64 @@ if (amb.currentLocation?.lat && amb.currentLocation?.lng) {
   return ambulances.length;
 }
 
-// ── Update ambulance status in Redis + MongoDB ────────────────────────────
 async function updateAmbulanceStatus(ambulanceId, newStatus) {
   const id = ambulanceId.toString();
 
-  // Update Redis
   await redis.set(`ambulance:${id}:status`, newStatus);
+  if (newStatus === 'AVAILABLE') await redis.sadd(AVAILABLE_SET_KEY, id);
+  else await redis.srem(AVAILABLE_SET_KEY, id);
 
-  if (newStatus === 'AVAILABLE') {
-    await redis.sadd(AVAILABLE_SET_KEY, id);
-  } else {
-    await redis.srem(AVAILABLE_SET_KEY, id);
-  }
-
-  // Update MongoDB
   await Ambulance.findByIdAndUpdate(ambulanceId, { status: newStatus });
 }
 
-// ── Get all available ambulances near a coordinate ────────────────────────
+async function updateAmbulanceLocation(ambulanceId, lat, lng, persistToMongo = true) {
+  const id = ambulanceId.toString();
+  const location = buildLocationPayload(lat, lng);
+
+  const pipeline = redis.pipeline();
+  pipeline.set(`ambulance:${id}:location`, JSON.stringify(location), 'EX', 300);
+  pipeline.set(`ambulance:${id}:zone`, ngeohash.encode(lat, lng, 4), 'EX', 300);
+  await pipeline.exec();
+
+  if (persistToMongo) {
+    await Ambulance.findByIdAndUpdate(ambulanceId, {
+      currentLocation: { lat, lng },
+      lastPing: new Date(),
+    });
+  }
+
+  return location;
+}
+
 async function getAvailableAmbulancesNear(lat, lng, radiusChars = 5) {
   const queryGeohash = ngeohash.encode(lat, lng, 7);
-  const prefix = queryGeohash.slice(0, radiusChars); // e.g. 'tnjn1'
+  const neighbours = ngeohash.neighbors(queryGeohash);
+  const prefixes = [
+    queryGeohash.slice(0, radiusChars),
+    ...Object.values(neighbours).map((hash) => hash.slice(0, radiusChars)),
+  ];
+  const uniquePrefixes = [...new Set(prefixes)];
 
-  // Get all available ambulance IDs from Redis Set
   const availableIds = await redis.smembers(AVAILABLE_SET_KEY);
-
   if (availableIds.length === 0) return [];
 
-  // Fetch their locations in one pipeline
   const pipeline = redis.pipeline();
-  for (const id of availableIds) {
-    pipeline.get(`ambulance:${id}:location`);
-  }
+  for (const id of availableIds) pipeline.get(`ambulance:${id}:location`);
   const results = await pipeline.exec();
 
-  // Filter by geohash prefix (same zone or adjacent)
   const nearby = [];
   for (let i = 0; i < availableIds.length; i++) {
-    const raw = results[i][1]; // [error, value] tuple
+    const raw = results[i]?.[1];
     if (!raw) continue;
-
     const location = JSON.parse(raw);
-    if (location.geohash.startsWith(prefix)) {
+    const geohash = location.geohash || ngeohash.encode(location.lat ?? location.latitude, location.lng ?? location.longitude, 7);
+
+    if (uniquePrefixes.some((prefix) => geohash.startsWith(prefix))) {
       nearby.push({
         ambulanceId: availableIds[i],
-        lat: location.latitude,
-        lng: location.longitude,
-        geohash: location.geohash,
+        lat: location.lat ?? location.latitude,
+        lng: location.lng ?? location.longitude,
+        geohash,
       });
     }
   }
@@ -110,14 +104,19 @@ async function getAvailableAmbulancesNear(lat, lng, radiusChars = 5) {
   return nearby;
 }
 
-// ── Get single ambulance status from Redis ────────────────────────────────
 async function getAmbulanceStatus(ambulanceId) {
-  return await redis.get(`ambulance:${ambulanceId.toString()}:status`);
+  return redis.get(`ambulance:${ambulanceId.toString()}:status`);
+}
+
+async function getAmbulanceForDriver(driverUserId) {
+  return Ambulance.findOne({ driverId: driverUserId });
 }
 
 module.exports = {
   syncAmbulancesToRedis,
   updateAmbulanceStatus,
+  updateAmbulanceLocation,
   getAvailableAmbulancesNear,
   getAmbulanceStatus,
+  getAmbulanceForDriver,
 };
