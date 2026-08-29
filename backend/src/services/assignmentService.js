@@ -2,7 +2,7 @@ const ngeohash = require('ngeohash');
 const redis = require('../config/redis');
 const Ambulance = require('../models/Ambulance');
 const EmergencySession = require('../models/EmergencySession');
-const { haversineDistance, getETAs } = require('./mapsService');
+const { haversineDistance, getETAsToDestination } = require('./mapsService');
 const logger = require('../utils/logger');
 const { getIO } = require('../sockets/emergencyRoom');
 
@@ -84,9 +84,9 @@ async function assignAmbulance(sessionId, patientLat, patientLng) {
 
   const top5 = candidates.slice(0, 5);
   const [etaSeconds, ambulanceDocs] = await Promise.all([
-    getETAs(
-      { lat: patientLat, lng: patientLng },
-      top5.map((a) => ({ lat: a.lat, lng: a.lng }))
+    getETAsToDestination(
+      top5.map((a) => ({ lat: a.lat, lng: a.lng })),
+      { lat: patientLat, lng: patientLng }
     ),
     Ambulance.find({ _id: { $in: top5.map((a) => a.ambulanceId) } }).lean(),
   ]);
@@ -144,8 +144,6 @@ async function assignAmbulance(sessionId, patientLat, patientLng) {
     const patientPayload = {
       sessionId,
       ambulanceId: best.ambulanceId,
-      driverName: ambulanceDoc?.driverName,
-      vehicleNumber: ambulanceDoc?.vehicleNumber,
       etaSeconds: best.etaSeconds,
       etaMinutes: Math.ceil(best.etaSeconds / 60),
       distanceKm: best.distanceKm,
