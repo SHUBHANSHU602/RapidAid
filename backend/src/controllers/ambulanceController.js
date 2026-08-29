@@ -1,7 +1,11 @@
 const Ambulance = require('../models/Ambulance');
 const EmergencySession = require('../models/EmergencySession');
 const AppError = require('../utils/AppError');
-const { updateAmbulanceStatus, getAmbulanceStatus } = require('../services/ambulanceCache');
+const {
+  updateAmbulanceStatus,
+  getAmbulanceStatus,
+  setAmbulanceOnline,
+} = require('../services/ambulanceCache');
 
 exports.getAllAmbulances = async (req, res, next) => {
   try {
@@ -85,6 +89,10 @@ exports.updateAmbulanceStatus = async (req, res, next) => {
     }
 
     await updateAmbulanceStatus(req.params.id, status);
+    if (role === 'driver') {
+      await setAmbulanceOnline(req.params.id, status === 'AVAILABLE');
+    }
+
     res.status(200).json({ success: true, message: `Ambulance status updated to ${status}`, data: { ambulanceId: req.params.id, status } });
   } catch (err) {
     next(err);
