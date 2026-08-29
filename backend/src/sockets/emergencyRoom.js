@@ -3,7 +3,7 @@ const { createAdapter } = require('@socket.io/redis-adapter');
 const EmergencySession = require('../models/EmergencySession');
 const Ambulance = require('../models/Ambulance');
 const { haversineDistance, getSingleETA } = require('../services/mapsService');
-const { updateAmbulanceLocation } = require('../services/ambulanceCache');
+const { updateAmbulanceLocation, setAmbulanceOnline } = require('../services/ambulanceCache');
 const redis = require('../config/redis');
 const logger = require('../utils/logger');
 
@@ -53,7 +53,10 @@ function initSocket(server) {
       socket.join(`driver:${socket.user.userId}`);
       try {
         const ambulance = await Ambulance.findOne({ driverId: socket.user.userId }).lean();
-        if (ambulance) socket.ambulanceId = ambulance._id.toString();
+        if (ambulance) {
+          socket.ambulanceId = ambulance._id.toString();
+          if (ambulance.status === 'AVAILABLE') await setAmbulanceOnline(socket.ambulanceId, true);
+        }
       } catch (err) {
         logger.warn(`Failed to resolve driver's ambulance: ${err.message}`);
       }
@@ -115,6 +118,8 @@ function initSocket(server) {
         }
         if (!socket.ambulanceId) return socket.emit('error', { message: 'No ambulance linked to this driver' });
 
+        await setAmbulanceOnline(socket.ambulanceId, true);
+
         const key = `ambulance:${socket.ambulanceId}:location`;
         const lastRaw = await redis.get(key);
         let movedMeters = Infinity;
@@ -149,6 +154,10 @@ function initSocket(server) {
     });
 
     socket.on('disconnect', async () => {
+      if (socket.ambulanceId) {
+        try { await setAmbulanceOnline(socket.ambulanceId, false); } catch (err) { logger.warn(err.message); }
+      }
+
       if (!socket.currentSessionId) return;
       const sessionId = socket.currentSessionId;
       stopETAInterval(sessionId);
