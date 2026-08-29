@@ -2,6 +2,7 @@ const ngeohash = require('ngeohash');
 const redis = require('../config/redis');
 const Ambulance = require('../models/Ambulance');
 const EmergencySession = require('../models/EmergencySession');
+const { getEligibleAmbulanceIds } = require('./ambulanceCache');
 const { haversineDistance, getETAsToDestination } = require('./mapsService');
 const logger = require('../utils/logger');
 const { getIO } = require('../sockets/emergencyRoom');
@@ -14,7 +15,7 @@ async function getNearbyAvailableAmbulances(lat, lng, maxCandidates = 10) {
   const prefixes = [target.slice(0, 5), ...Object.values(neighbours).map((n) => n.slice(0, 5))];
   const uniquePrefixes = [...new Set(prefixes)];
 
-  const availableIds = await redis.smembers(AVAILABLE_SET_KEY);
+  const availableIds = await getEligibleAmbulanceIds();
   if (!availableIds.length) return [];
 
   const pipeline = redis.pipeline();
@@ -58,11 +59,19 @@ async function reserveAmbulance(ambulanceId) {
     local status = redis.call('GET', KEYS[1])
     if status ~= 'AVAILABLE' then return 0 end
     if redis.call('SISMEMBER', KEYS[2], ARGV[1]) == 0 then return 0 end
+    if redis.call('SISMEMBER', KEYS[3], ARGV[1]) == 0 then return 0 end
     redis.call('SET', KEYS[1], 'BUSY')
     redis.call('SREM', KEYS[2], ARGV[1])
     return 1
   `;
-  const result = await redis.eval(lua, 2, `ambulance:${id}:status`, AVAILABLE_SET_KEY, id);
+  const result = await redis.eval(
+    lua,
+    3,
+    `ambulance:${id}:status`,
+    AVAILABLE_SET_KEY,
+    'ambulance:online',
+    id
+  );
   return result === 1;
 }
 
@@ -78,7 +87,7 @@ async function assignAmbulance(sessionId, patientLat, patientLng) {
   const startedAt = Date.now();
   const candidates = await getNearbyAvailableAmbulances(patientLat, patientLng, 10);
   if (!candidates.length) {
-    logger.warn(`No available ambulances near ${patientLat},${patientLng}`);
+    logger.warn(`No online available ambulances near ${patientLat},${patientLng}`);
     return null;
   }
 
