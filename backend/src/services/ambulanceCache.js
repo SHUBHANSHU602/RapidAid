@@ -3,6 +3,7 @@ const Ambulance = require('../models/Ambulance');
 const ngeohash = require('ngeohash');
 
 const AVAILABLE_SET_KEY = 'ambulance:available';
+const ONLINE_SET_KEY = 'ambulance:online';
 
 function buildLocationPayload(lat, lng) {
   return {
@@ -20,6 +21,7 @@ async function syncAmbulancesToRedis() {
   const pipeline = redis.pipeline();
 
   pipeline.del(AVAILABLE_SET_KEY);
+  pipeline.del(ONLINE_SET_KEY); // nobody is considered online after a backend restart until their app reconnects
 
   for (const amb of ambulances) {
     const id = amb._id.toString();
@@ -49,6 +51,12 @@ async function updateAmbulanceStatus(ambulanceId, newStatus) {
   await Ambulance.findByIdAndUpdate(ambulanceId, { status: newStatus });
 }
 
+async function setAmbulanceOnline(ambulanceId, online) {
+  const id = ambulanceId.toString();
+  if (online) await redis.sadd(ONLINE_SET_KEY, id);
+  else await redis.srem(ONLINE_SET_KEY, id);
+}
+
 async function updateAmbulanceLocation(ambulanceId, lat, lng, persistToMongo = true) {
   const id = ambulanceId.toString();
   const location = buildLocationPayload(lat, lng);
@@ -56,6 +64,7 @@ async function updateAmbulanceLocation(ambulanceId, lat, lng, persistToMongo = t
   const pipeline = redis.pipeline();
   pipeline.set(`ambulance:${id}:location`, JSON.stringify(location), 'EX', 300);
   pipeline.set(`ambulance:${id}:zone`, ngeohash.encode(lat, lng, 4), 'EX', 300);
+  pipeline.sadd(ONLINE_SET_KEY, id);
   await pipeline.exec();
 
   if (persistToMongo) {
@@ -68,6 +77,15 @@ async function updateAmbulanceLocation(ambulanceId, lat, lng, persistToMongo = t
   return location;
 }
 
+async function getEligibleAmbulanceIds() {
+  const [availableIds, onlineIds] = await Promise.all([
+    redis.smembers(AVAILABLE_SET_KEY),
+    redis.smembers(ONLINE_SET_KEY),
+  ]);
+  const online = new Set(onlineIds);
+  return availableIds.filter((id) => online.has(id));
+}
+
 async function getAvailableAmbulancesNear(lat, lng, radiusChars = 5) {
   const queryGeohash = ngeohash.encode(lat, lng, 7);
   const neighbours = ngeohash.neighbors(queryGeohash);
@@ -77,7 +95,7 @@ async function getAvailableAmbulancesNear(lat, lng, radiusChars = 5) {
   ];
   const uniquePrefixes = [...new Set(prefixes)];
 
-  const availableIds = await redis.smembers(AVAILABLE_SET_KEY);
+  const availableIds = await getEligibleAmbulanceIds();
   if (availableIds.length === 0) return [];
 
   const pipeline = redis.pipeline();
@@ -116,6 +134,8 @@ module.exports = {
   syncAmbulancesToRedis,
   updateAmbulanceStatus,
   updateAmbulanceLocation,
+  setAmbulanceOnline,
+  getEligibleAmbulanceIds,
   getAvailableAmbulancesNear,
   getAmbulanceStatus,
   getAmbulanceForDriver,
