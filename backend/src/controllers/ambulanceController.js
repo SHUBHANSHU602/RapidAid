@@ -1,6 +1,7 @@
 const Ambulance = require('../models/Ambulance');
 const EmergencySession = require('../models/EmergencySession');
 const AppError = require('../utils/AppError');
+const redis = require('../config/redis');
 const {
   updateAmbulanceStatus,
   updateAmbulanceLocation,
@@ -40,7 +41,7 @@ async function dispatchOldestPendingEmergency() {
     const { scheduleDelayDetection } = require('../workers/delayDetection.worker');
     await scheduleDelayDetection(
       pending._id,
-      Math.max(1, Number(result.etaSeconds) / 60)
+      Math.max(1, Number(result.etaMinutes) || Number(result.etaSeconds) / 60)
     );
   }
 
@@ -149,9 +150,31 @@ exports.getMyActiveSession = async (req, res, next) => {
       status: { $in: ['ASSIGNED', 'EN_ROUTE', 'DELAYED'] },
     }).sort({ createdAt: -1 }).populate('hospitalId', 'name location address');
 
+    if (!session) {
+      return res.status(200).json({ success: true, data: null });
+    }
+
+    let etaMinutes = null;
+    try {
+      const etaRaw = await redis.get(`session:${session._id}:eta`);
+      if (etaRaw) {
+        const parsed = JSON.parse(etaRaw);
+        if (Number.isFinite(Number(parsed.etaMinutes))) etaMinutes = Number(parsed.etaMinutes);
+      }
+    } catch {
+      // Fall through to event-log recovery below.
+    }
+
+    if (etaMinutes == null) {
+      const assignedEvent = [...(session.eventLog || [])]
+        .reverse()
+        .find((event) => event.status === 'ASSIGNED' && Number(event.meta?.etaSeconds) > 0);
+      if (assignedEvent) etaMinutes = Math.max(1, Math.ceil(Number(assignedEvent.meta.etaSeconds) / 60));
+    }
+
     res.status(200).json({
       success: true,
-      data: session ? { ...session.toObject(), ambulance } : null,
+      data: { ...session.toObject(), ambulance, etaMinutes },
     });
   } catch (err) {
     next(err);
