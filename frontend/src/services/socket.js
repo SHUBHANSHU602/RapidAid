@@ -9,8 +9,7 @@ function currentToken() {
 export function connectSocket() {
   const token = currentToken();
 
-  // Reuse the same Socket instance. Creating a second instance while the first one
-  // is reconnecting causes duplicate server connections and duplicate events.
+  // Reuse one Socket instance so reconnects do not create duplicate connections/events.
   if (socket) {
     socket.auth = { token };
     if (!socket.connected) socket.connect();
@@ -35,6 +34,19 @@ export function connectSocket() {
 
 export function getSocket() {
   return connectSocket();
+}
+
+export function updateSocketToken(accessToken) {
+  if (!socket) return;
+
+  socket.auth = { token: accessToken };
+
+  // Socket auth is verified during the handshake, so reconnect with the new JWT.
+  // useJoinSession/useJoinAsDriver rejoin their rooms on the next `connect` event.
+  if (socket.connected) {
+    socket.disconnect();
+    socket.connect();
+  }
 }
 
 export function disconnectSocket() {
