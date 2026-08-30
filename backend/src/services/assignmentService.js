@@ -52,9 +52,6 @@ async function getNearbyAvailableAmbulances(lat, lng, maxCandidates = 10) {
     uniquePrefixes.some((prefix) => candidate.geohash.startsWith(prefix))
   );
 
-  // Production keeps the geohash locality constraint. During a demo, browser GPS can
-  // occasionally land in a neighbouring/coarse bucket, so fall back to the nearest
-  // actually-online ambulance instead of leaving the emergency permanently unassigned.
   const candidatePool = localCandidates.length
     ? localCandidates
     : process.env.DEMO_MODE === 'true'
@@ -129,10 +126,11 @@ async function assignAmbulance(sessionId, patientLat, patientLng) {
   const scored = top5.map((candidate, index) => {
     const doc = docMap[candidate.ambulanceId];
     const lastPingMs = doc?.lastPing ? new Date(doc.lastPing).getTime() : 0;
+    const candidateEta = Number(etaSeconds[index]) || 0;
     return {
       ...candidate,
-      etaSeconds: Number(etaSeconds[index]) || 0,
-      score: scoreCandidate(Number(etaSeconds[index]) || 0, candidate.distanceKm, lastPingMs),
+      etaSeconds: candidateEta,
+      score: scoreCandidate(candidateEta, candidate.distanceKm, lastPingMs),
     };
   }).sort((a, b) => a.score - b.score);
 
@@ -157,6 +155,8 @@ async function assignAmbulance(sessionId, patientLat, patientLng) {
     }
 
     const ambulanceDoc = docMap[best.ambulanceId] || await Ambulance.findById(best.ambulanceId).lean();
+    const etaMinutes = Math.max(1, Math.ceil(best.etaSeconds / 60));
+
     session.ambulanceId = best.ambulanceId;
     if (session.status === 'INITIATED') session.status = 'ASSIGNED';
     session.addEvent('ASSIGNED', {
@@ -172,6 +172,16 @@ async function assignAmbulance(sessionId, patientLat, patientLng) {
         assignedSessionId: sessionId,
         status: 'BUSY',
       }),
+      redis.set(
+        `session:${sessionId}:eta`,
+        JSON.stringify({
+          etaMinutes,
+          source: 'assignment',
+          calculatedAt: new Date().toISOString(),
+        }),
+        'EX',
+        300
+      ),
     ]);
 
     const io = getIO();
@@ -179,7 +189,7 @@ async function assignAmbulance(sessionId, patientLat, patientLng) {
       sessionId,
       ambulanceId: best.ambulanceId,
       etaSeconds: best.etaSeconds,
-      etaMinutes: Math.max(1, Math.ceil(best.etaSeconds / 60)),
+      etaMinutes,
       distanceKm: best.distanceKm,
     };
 
@@ -192,14 +202,15 @@ async function assignAmbulance(sessionId, patientLat, patientLng) {
         severityLevel: session.severityLevel,
         patientLocation: session.location,
         description: session.description,
-        etaMinutes: patientPayload.etaMinutes,
+        etaMinutes,
       });
     }
 
-    logger.info(`Assignment complete in ${Date.now() - startedAt}ms | ambulance=${best.ambulanceId}`);
+    logger.info(`Assignment complete in ${Date.now() - startedAt}ms | ambulance=${best.ambulanceId} | eta=${etaMinutes}m`);
     return {
       ambulanceId: best.ambulanceId,
       etaSeconds: best.etaSeconds,
+      etaMinutes,
       distanceKm: best.distanceKm,
       score: best.score,
       latency: Date.now() - startedAt,
