@@ -40,11 +40,14 @@ async function recoverActiveDelayMonitors() {
       }
 
       if (!initialEtaMinutes) initialEtaMinutes = 5;
-      await scheduleDelayDetection(session._id, initialEtaMinutes);
-      recovered += 1;
+      const scheduled = await scheduleDelayDetection(session._id, initialEtaMinutes);
+      if (scheduled) recovered += 1;
     }
 
     if (recovered) logger.info(`Recovered delay monitoring for ${recovered} active session(s)`);
+    if (sessions.length && recovered !== sessions.length) {
+      logger.warn(`Delay monitor recovery incomplete: ${recovered}/${sessions.length} active session(s)`);
+    }
   } catch (err) {
     logger.warn(`Failed to recover active delay monitors: ${err.message}`);
   }
@@ -63,8 +66,7 @@ const startServer = async () => {
   const httpServer = http.createServer(app);
   initSocket(httpServer);
 
-  // BullMQ repeatable jobs are recovered for sessions that were already active when
-  // this backend instance started. This makes delay/fallback monitoring restart-safe.
+  // Restore monitoring for emergencies that were active before this process started.
   await recoverActiveDelayMonitors();
 
   httpServer.listen(PORT, () => {
