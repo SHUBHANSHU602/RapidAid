@@ -50,7 +50,9 @@ export default function DriverDashboard() {
           const activeRes = await api.get('/ambulances/me/active-session');
           if (activeRes.data.data) {
             setAssignment(activeRes.data.data);
-            setEtaMinutes(activeRes.data.data?.etaMinutes || null);
+            setEtaMinutes(activeRes.data.data?.etaMinutes ?? null);
+            // BUSY is still on-duty. Do not show an active driver as "offline".
+            setIsOnline(true);
           }
         } catch (err) {
           if (err.response?.status !== 404) throw err;
@@ -68,8 +70,8 @@ export default function DriverDashboard() {
     });
   }, [loadDriverState]);
 
-  // Socket.io remains the primary path. This small recovery poll makes the demo
-  // robust if an assignment event is emitted during a reconnect or tab wake-up.
+  // Socket.io remains the primary assignment path. Polling is only recovery for a
+  // reconnect/tab-wake race so the demo cannot get stuck after the server assigned us.
   useEffect(() => {
     if (!isOnline || assignment) return undefined;
 
@@ -78,6 +80,8 @@ export default function DriverDashboard() {
         const activeRes = await api.get('/ambulances/me/active-session');
         if (activeRes.data.data) {
           setAssignment(activeRes.data.data);
+          setEtaMinutes(activeRes.data.data?.etaMinutes ?? null);
+          setIsOnline(true);
           setAlert('Emergency assignment recovered from the server.');
         }
       } catch {
@@ -92,13 +96,15 @@ export default function DriverDashboard() {
   useJoinAsDriver(assignment?._id);
 
   useSocketEvent('driver_assignment', useCallback(async (data) => {
+    setIsOnline(true);
     setAlert(data.swapped ? 'You were assigned as the replacement ambulance.' : 'New emergency assigned to you.');
     try {
       const res = await api.get('/ambulances/me/active-session');
       setAssignment(res.data.data || { _id: data.sessionId, ...data, location: data.patientLocation });
-      setEtaMinutes(data.etaMinutes ?? null);
+      setEtaMinutes(data.etaMinutes ?? res.data.data?.etaMinutes ?? null);
     } catch {
       setAssignment({ _id: data.sessionId, ...data, location: data.patientLocation });
+      setEtaMinutes(data.etaMinutes ?? null);
     }
   }, []), []);
 
@@ -160,9 +166,9 @@ export default function DriverDashboard() {
         const activeRes = await api.get('/ambulances/me/active-session');
         if (activeRes.data.data) {
           setAssignment(activeRes.data.data);
-          setEtaMinutes(provisionRes.data.assignment?.etaSeconds
+          setEtaMinutes(activeRes.data.data?.etaMinutes ?? (provisionRes.data.assignment?.etaSeconds
             ? Math.ceil(provisionRes.data.assignment.etaSeconds / 60)
-            : null);
+            : null));
           setAlert('You are online. A pending emergency has been assigned to you.');
         } else {
           setAlert('You are online and available for emergency assignments.');
@@ -188,6 +194,7 @@ export default function DriverDashboard() {
     if (!assignment?._id) return;
     const res = await api.post(`/emergency/${assignment._id}/transition`, { status: 'EN_ROUTE' });
     setAssignment(res.data.data);
+    setIsOnline(true);
     setAlert('Trip started. Live location and ETA monitoring are active.');
   };
 
@@ -217,11 +224,11 @@ export default function DriverDashboard() {
             </p>
           </div>
           <Button
-            variant={isOnline ? 'danger' : 'success'}
+            variant={assignment ? 'success' : isOnline ? 'danger' : 'success'}
             onClick={toggleOnline}
             disabled={!!assignment || changingStatus}
           >
-            {changingStatus ? 'Please wait…' : isOnline ? 'Go Offline' : 'Go Online'}
+            {assignment ? 'On Duty' : changingStatus ? 'Please wait…' : isOnline ? 'Go Offline' : 'Go Online'}
           </Button>
         </div>
 
