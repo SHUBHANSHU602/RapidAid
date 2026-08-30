@@ -22,27 +22,52 @@ async function getNearbyAvailableAmbulances(lat, lng, maxCandidates = 10) {
   for (const id of availableIds) pipeline.get(`ambulance:${id}:location`);
   const results = await pipeline.exec();
 
-  const candidates = [];
+  const allCandidates = [];
   for (let i = 0; i < availableIds.length; i++) {
     const raw = results[i]?.[1];
     if (!raw) continue;
-    const location = JSON.parse(raw);
-    const aLat = location.lat ?? location.latitude;
-    const aLng = location.lng ?? location.longitude;
+
+    let location;
+    try {
+      location = JSON.parse(raw);
+    } catch {
+      continue;
+    }
+
+    const aLat = Number(location.lat ?? location.latitude);
+    const aLng = Number(location.lng ?? location.longitude);
     if (!Number.isFinite(aLat) || !Number.isFinite(aLng)) continue;
 
     const geohash = location.geohash || ngeohash.encode(aLat, aLng, 7);
-    if (!uniquePrefixes.some((prefix) => geohash.startsWith(prefix))) continue;
-
-    candidates.push({
+    allCandidates.push({
       ambulanceId: availableIds[i],
       lat: aLat,
       lng: aLng,
+      geohash,
       distanceKm: haversineDistance(lat, lng, aLat, aLng),
     });
   }
 
-  return candidates.sort((a, b) => a.distanceKm - b.distanceKm).slice(0, maxCandidates);
+  const localCandidates = allCandidates.filter((candidate) =>
+    uniquePrefixes.some((prefix) => candidate.geohash.startsWith(prefix))
+  );
+
+  // Production keeps the geohash locality constraint. During a demo, browser GPS can
+  // occasionally land in a neighbouring/coarse bucket, so fall back to the nearest
+  // actually-online ambulance instead of leaving the emergency permanently unassigned.
+  const candidatePool = localCandidates.length
+    ? localCandidates
+    : process.env.DEMO_MODE === 'true'
+      ? allCandidates
+      : [];
+
+  if (!localCandidates.length && candidatePool.length) {
+    logger.warn(`Demo geohash fallback: considering ${candidatePool.length} online ambulance(s)`);
+  }
+
+  return candidatePool
+    .sort((a, b) => a.distanceKm - b.distanceKm)
+    .slice(0, maxCandidates);
 }
 
 function scoreCandidate(etaSeconds, distanceKm, lastPingMs) {
@@ -106,8 +131,8 @@ async function assignAmbulance(sessionId, patientLat, patientLng) {
     const lastPingMs = doc?.lastPing ? new Date(doc.lastPing).getTime() : 0;
     return {
       ...candidate,
-      etaSeconds: etaSeconds[index],
-      score: scoreCandidate(etaSeconds[index], candidate.distanceKm, lastPingMs),
+      etaSeconds: Number(etaSeconds[index]) || 0,
+      score: scoreCandidate(Number(etaSeconds[index]) || 0, candidate.distanceKm, lastPingMs),
     };
   }).sort((a, b) => a.score - b.score);
 
@@ -154,7 +179,7 @@ async function assignAmbulance(sessionId, patientLat, patientLng) {
       sessionId,
       ambulanceId: best.ambulanceId,
       etaSeconds: best.etaSeconds,
-      etaMinutes: Math.ceil(best.etaSeconds / 60),
+      etaMinutes: Math.max(1, Math.ceil(best.etaSeconds / 60)),
       distanceKm: best.distanceKm,
     };
 
@@ -167,7 +192,7 @@ async function assignAmbulance(sessionId, patientLat, patientLng) {
         severityLevel: session.severityLevel,
         patientLocation: session.location,
         description: session.description,
-        etaMinutes: Math.ceil(best.etaSeconds / 60),
+        etaMinutes: patientPayload.etaMinutes,
       });
     }
 
