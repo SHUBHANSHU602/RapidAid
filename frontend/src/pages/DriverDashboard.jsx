@@ -68,6 +68,27 @@ export default function DriverDashboard() {
     });
   }, [loadDriverState]);
 
+  // Socket.io remains the primary path. This small recovery poll makes the demo
+  // robust if an assignment event is emitted during a reconnect or tab wake-up.
+  useEffect(() => {
+    if (!isOnline || assignment) return undefined;
+
+    const recoverAssignment = async () => {
+      try {
+        const activeRes = await api.get('/ambulances/me/active-session');
+        if (activeRes.data.data) {
+          setAssignment(activeRes.data.data);
+          setAlert('Emergency assignment recovered from the server.');
+        }
+      } catch {
+        // Keep waiting; normal Socket.io delivery remains the primary path.
+      }
+    };
+
+    const timer = setInterval(recoverAssignment, 5000);
+    return () => clearInterval(timer);
+  }, [isOnline, assignment]);
+
   useJoinAsDriver(assignment?._id);
 
   useSocketEvent('driver_assignment', useCallback(async (data) => {
