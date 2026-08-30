@@ -18,40 +18,50 @@ function getStallThresholdSeconds() {
   return process.env.DEMO_MODE === 'true' ? 30 : 120;
 }
 
+function schedulerIdFor(sessionId) {
+  return `delay-${sessionId}`;
+}
+
 async function scheduleDelayDetection(sessionId, initialEtaMinutes) {
   try {
-    const existingJobs = await delayQueue.getRepeatableJobs();
-    const existing = existingJobs.find((j) => j.name === `delay:${sessionId}`);
-    if (existing) await delayQueue.removeRepeatableByKey(existing.key);
+    const schedulerId = schedulerIdFor(sessionId);
+    const every = process.env.DEMO_MODE === 'true' ? 15000 : 60000;
 
-    await redis.set(`session:${sessionId}:last_movement_at`, Date.now().toString(), 'EX', 7200);
-
-    await delayQueue.add(
-      `delay:${sessionId}`,
-      { sessionId, initialEtaMinutes },
+    // BullMQ v6 removed legacy repeatable-job APIs. Job Schedulers are now the
+    // supported way to create/update recurring work, and upsert prevents duplicates.
+    await delayQueue.upsertJobScheduler(
+      schedulerId,
+      { every },
       {
-        repeat: { every: process.env.DEMO_MODE === 'true' ? 15000 : 60000 },
-        // BullMQ custom job ids cannot contain ':'. Keep the readable colon in the
-        // repeatable job name, but use a safe id for the underlying job.
-        jobId: `delay-${sessionId}`,
-        attempts: 3,
-        backoff: { type: 'exponential', delay: 1000 },
+        name: `delay:${sessionId}`,
+        data: { sessionId: sessionId.toString(), initialEtaMinutes: Number(initialEtaMinutes) || 5 },
+        opts: {
+          attempts: 3,
+          backoff: { type: 'exponential', delay: 1000 },
+          removeOnComplete: 20,
+          removeOnFail: 50,
+        },
       }
     );
-    logger.info(`Delay detection scheduled for ${sessionId}`);
+
+    await redis.set(`session:${sessionId}:last_movement_at`, Date.now().toString(), 'EX', 7200);
+    logger.info(`Delay detection scheduled for ${sessionId} every ${every / 1000}s`);
+    return true;
   } catch (err) {
     logger.error(`Failed to schedule delay detection for ${sessionId}: ${err.message}`);
+    return false;
   }
 }
 
 async function cancelDelayDetection(sessionId) {
   try {
-    const jobs = await delayQueue.getRepeatableJobs();
-    const job = jobs.find((j) => j.name === `delay:${sessionId}`);
-    if (job) await delayQueue.removeRepeatableByKey(job.key);
+    await delayQueue.removeJobScheduler(schedulerIdFor(sessionId));
     await redis.del(`session:${sessionId}:last_movement_at`);
+    logger.info(`Delay detection cancelled for ${sessionId}`);
+    return true;
   } catch (err) {
     logger.error(`Failed to cancel delay detection: ${sessionId} | ${err.message}`);
+    return false;
   }
 }
 
@@ -72,13 +82,26 @@ const worker = new Worker(
       redis.get(`session:${sessionId}:last_movement_at`),
     ]);
 
-    const currentEta = etaRaw ? JSON.parse(etaRaw).etaMinutes : initialEtaMinutes;
-    const drift = Number(currentEta) - Number(initialEtaMinutes);
+    let currentEta = Number(initialEtaMinutes) || 5;
+    if (etaRaw) {
+      try {
+        const parsed = JSON.parse(etaRaw);
+        if (Number(parsed.etaMinutes) > 0) currentEta = Number(parsed.etaMinutes);
+      } catch {
+        // Keep scheduler baseline if the cached ETA is malformed.
+      }
+    }
+
+    const drift = currentEta - Number(initialEtaMinutes || 0);
     const stalledSeconds = lastMovementRaw ? Math.floor((Date.now() - Number(lastMovementRaw)) / 1000) : 0;
     const stallThreshold = getStallThresholdSeconds();
 
     const delayedByEta = drift > 3;
     const delayedByStall = session.status === 'EN_ROUTE' && stalledSeconds >= stallThreshold;
+
+    logger.debug(
+      `Delay check session=${sessionId} status=${session.status} eta=${currentEta} drift=${drift.toFixed(1)} stalled=${stalledSeconds}s`
+    );
 
     if (delayedByEta || delayedByStall) {
       await handleDelay(sessionId, {
