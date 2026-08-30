@@ -102,21 +102,40 @@ async function getAvailableAmbulancesNear(lat, lng, radiusChars = 5) {
   for (const id of availableIds) pipeline.get(`ambulance:${id}:location`);
   const results = await pipeline.exec();
 
-  const nearby = [];
+  const allCandidates = [];
   for (let i = 0; i < availableIds.length; i++) {
     const raw = results[i]?.[1];
     if (!raw) continue;
-    const location = JSON.parse(raw);
-    const geohash = location.geohash || ngeohash.encode(location.lat ?? location.latitude, location.lng ?? location.longitude, 7);
 
-    if (uniquePrefixes.some((prefix) => geohash.startsWith(prefix))) {
-      nearby.push({
-        ambulanceId: availableIds[i],
-        lat: location.lat ?? location.latitude,
-        lng: location.lng ?? location.longitude,
-        geohash,
-      });
+    let location;
+    try {
+      location = JSON.parse(raw);
+    } catch {
+      continue;
     }
+
+    const aLat = Number(location.lat ?? location.latitude);
+    const aLng = Number(location.lng ?? location.longitude);
+    if (!Number.isFinite(aLat) || !Number.isFinite(aLng)) continue;
+
+    const geohash = location.geohash || ngeohash.encode(aLat, aLng, 7);
+    allCandidates.push({
+      ambulanceId: availableIds[i],
+      lat: aLat,
+      lng: aLng,
+      geohash,
+    });
+  }
+
+  const nearby = allCandidates.filter((candidate) =>
+    uniquePrefixes.some((prefix) => candidate.geohash.startsWith(prefix))
+  );
+
+  // Keep the geohash boundary for normal operation. In demo mode, if browser GPS
+  // puts the second driver just outside the current bucket, still consider the
+  // actually-online replacement rather than making the swap impossible.
+  if (!nearby.length && process.env.DEMO_MODE === 'true' && allCandidates.length) {
+    return allCandidates;
   }
 
   return nearby;
