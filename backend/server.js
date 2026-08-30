@@ -11,11 +11,23 @@ require('./src/workers/mapsQueue.worker');
 const { scheduleDelayDetection } = require('./src/workers/delayDetection.worker');
 const PORT = process.env.PORT || 5000;
 
+function getRecoveryWindowHours() {
+  if (process.env.ACTIVE_SESSION_RECOVERY_HOURS) {
+    const configured = Number(process.env.ACTIVE_SESSION_RECOVERY_HOURS);
+    if (Number.isFinite(configured) && configured > 0) return configured;
+  }
+  return process.env.DEMO_MODE === 'true' ? 2 : 12;
+}
+
 async function recoverActiveDelayMonitors() {
   try {
+    const recoveryHours = getRecoveryWindowHours();
+    const cutoff = new Date(Date.now() - recoveryHours * 60 * 60 * 1000);
+
     const sessions = await EmergencySession.find({
       ambulanceId: { $ne: null },
       status: { $in: ['ASSIGNED', 'EN_ROUTE', 'DELAYED'] },
+      updatedAt: { $gte: cutoff },
     }).lean();
 
     let recovered = 0;
@@ -44,10 +56,11 @@ async function recoverActiveDelayMonitors() {
       if (scheduled) recovered += 1;
     }
 
-    if (recovered) logger.info(`Recovered delay monitoring for ${recovered} active session(s)`);
+    if (recovered) logger.info(`Recovered delay monitoring for ${recovered} recent active session(s)`);
     if (sessions.length && recovered !== sessions.length) {
-      logger.warn(`Delay monitor recovery incomplete: ${recovered}/${sessions.length} active session(s)`);
+      logger.warn(`Delay monitor recovery incomplete: ${recovered}/${sessions.length} recent active session(s)`);
     }
+    logger.info(`Delay recovery window: last ${recoveryHours} hour(s)`);
   } catch (err) {
     logger.warn(`Failed to recover active delay monitors: ${err.message}`);
   }
@@ -66,7 +79,8 @@ const startServer = async () => {
   const httpServer = http.createServer(app);
   initSocket(httpServer);
 
-  // Restore monitoring for emergencies that were active before this process started.
+  // Restore monitoring only for recent live-looking emergencies after a restart.
+  // Old unfinished demo records remain in MongoDB but are not resurrected as live trips.
   await recoverActiveDelayMonitors();
 
   httpServer.listen(PORT, () => {
