@@ -4,6 +4,7 @@ const { protect } = require('../middleware/auth');
 const {
   getAllAmbulances,
   getMyAmbulance,
+  provisionMyAmbulance,
   getMyActiveSession,
   getAmbulanceById,
   updateAmbulanceStatus,
@@ -12,6 +13,7 @@ const {
 router.use(protect);
 
 router.get('/me', getMyAmbulance);
+router.post('/me/provision', provisionMyAmbulance);
 router.get('/me/active-session', getMyActiveSession);
 router.get('/', getAllAmbulances);
 router.get('/:id', getAmbulanceById);
