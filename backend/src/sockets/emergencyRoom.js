@@ -135,14 +135,42 @@ function initSocket(server) {
           socket.driverLocation = { lat: latitude, lng: longitude };
 
           if (socket.currentSessionId) {
-            await redis.set(`session:${socket.currentSessionId}:last_movement_at`, Date.now().toString(), 'EX', 7200);
-            io.to(`session:${socket.currentSessionId}`).emit('driver_location', {
+            const sessionId = socket.currentSessionId;
+            await redis.set(`session:${sessionId}:last_movement_at`, Date.now().toString(), 'EX', 7200);
+
+            io.to(`session:${sessionId}`).emit('driver_location', {
               driverId: socket.user.userId,
               ambulanceId: socket.ambulanceId,
               latitude,
               longitude,
               timestamp: locationData.updatedAt,
             });
+
+            // Movement after a stall is a real recovery signal. Resume EN_ROUTE and
+            // clear staged fallback escalation so the trip can be monitored normally.
+            const active = await EmergencySession.findById(sessionId);
+            if (active?.status === 'DELAYED' && active.ambulanceId?.toString() === socket.ambulanceId) {
+              active.status = 'EN_ROUTE';
+              active.addEvent('DELAY_RECOVERED', {
+                recoveredAt: new Date().toISOString(),
+                movedMeters: Math.round(movedMeters),
+              });
+              await active.save();
+              await redis.del(
+                `session:${sessionId}:fallback_stage`,
+                `session:${sessionId}:fallback_stage_at`
+              );
+
+              io.to(`session:${sessionId}`).emit('session_status_changed', {
+                sessionId,
+                oldStatus: 'DELAYED',
+                newStatus: 'EN_ROUTE',
+              });
+              io.to(`session:${sessionId}`).emit('delay_cleared', {
+                sessionId,
+                message: 'Ambulance movement resumed. The current trip is active again.',
+              });
+            }
           }
         } else {
           await redis.expire(key, 300);
@@ -193,8 +221,9 @@ function startETAInterval(socket, sessionId) {
       if (!driverLoc || !socket.patientLocation) return;
 
       const etaMinutes = await getSingleETA(driverLoc.lat, driverLoc.lng, socket.patientLocation.lat, socket.patientLocation.lng);
-      await redis.set(`session:${sessionId}:eta`, JSON.stringify({ etaMinutes, calculatedAt: new Date().toISOString() }), 'EX', 90);
-      io.to(`session:${sessionId}`).emit('eta_update', { sessionId, etaMinutes, calculatedAt: new Date().toISOString() });
+      const calculatedAt = new Date().toISOString();
+      await redis.set(`session:${sessionId}:eta`, JSON.stringify({ etaMinutes, calculatedAt }), 'EX', 90);
+      io.to(`session:${sessionId}`).emit('eta_update', { sessionId, etaMinutes, calculatedAt });
     } catch (err) {
       logger.error(`ETA calculation failed for ${sessionId}: ${err.message}`);
     }
