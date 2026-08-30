@@ -51,7 +51,6 @@ export default function DriverDashboard() {
           if (activeRes.data.data) {
             setAssignment(activeRes.data.data);
             setEtaMinutes(activeRes.data.data?.etaMinutes ?? null);
-            // BUSY is still on-duty. Do not show an active driver as "offline".
             setIsOnline(true);
           }
         } catch (err) {
@@ -70,8 +69,6 @@ export default function DriverDashboard() {
     });
   }, [loadDriverState]);
 
-  // Socket.io remains the primary assignment path. Polling is only recovery for a
-  // reconnect/tab-wake race so the demo cannot get stuck after the server assigned us.
   useEffect(() => {
     if (!isOnline || assignment) return undefined;
 
@@ -85,7 +82,7 @@ export default function DriverDashboard() {
           setAlert('Emergency assignment recovered from the server.');
         }
       } catch {
-        // Keep waiting; normal Socket.io delivery remains the primary path.
+        // Socket.io remains the primary assignment path.
       }
     };
 
@@ -123,7 +120,7 @@ export default function DriverDashboard() {
   }, []), []);
 
   useSocketEvent('reroute_suggested', useCallback((data) => {
-    setAlert(`Reroute suggested. Latest ETA: ${data.freshEta} min.`);
+    setAlert(`Reroute suggested. Latest ETA: ${data.freshEta} min. Re-open navigation to refresh the route.`);
   }, []), []);
 
   useSocketEvent('route_updated', useCallback((data) => {
@@ -131,11 +128,17 @@ export default function DriverDashboard() {
     setAlert('A faster route was found. Open navigation to follow it.');
   }, []), []);
 
-  useSocketEvent('assignment_cancelled', useCallback(() => {
-    setAlert('This emergency was reassigned to a closer ambulance. You are available again.');
+  useSocketEvent('assignment_cancelled', useCallback((data) => {
     setAssignment(null);
     setEtaMinutes(null);
-    setIsOnline(true);
+
+    if (data?.takenOffline) {
+      setIsOnline(false);
+      setAlert('This emergency was reassigned because your ambulance stalled. You were taken offline; click Go Online when ready again.');
+    } else {
+      setIsOnline(true);
+      setAlert('This emergency was reassigned to a closer ambulance. You are available again.');
+    }
   }, []), []);
 
   const toggleOnline = async () => {
