@@ -2,12 +2,53 @@ require('dotenv').config();
 const http = require('http');
 const app = require('./app');
 const connectDB = require('./src/config/db');
+const redis = require('./src/config/redis');
 const logger = require('./src/utils/logger');
+const EmergencySession = require('./src/models/EmergencySession');
 const { syncAmbulancesToRedis } = require('./src/services/ambulanceCache');
 const { initSocket } = require('./src/sockets/emergencyRoom');
 require('./src/workers/mapsQueue.worker');
-require('./src/workers/delayDetection.worker');
+const { scheduleDelayDetection } = require('./src/workers/delayDetection.worker');
 const PORT = process.env.PORT || 5000;
+
+async function recoverActiveDelayMonitors() {
+  try {
+    const sessions = await EmergencySession.find({
+      ambulanceId: { $ne: null },
+      status: { $in: ['ASSIGNED', 'EN_ROUTE', 'DELAYED'] },
+    }).lean();
+
+    let recovered = 0;
+    for (const session of sessions) {
+      let initialEtaMinutes = null;
+
+      try {
+        const etaRaw = await redis.get(`session:${session._id}:eta`);
+        if (etaRaw) {
+          const parsed = JSON.parse(etaRaw);
+          if (Number(parsed.etaMinutes) > 0) initialEtaMinutes = Number(parsed.etaMinutes);
+        }
+      } catch {
+        // Recover from the durable assignment event below.
+      }
+
+      if (!initialEtaMinutes) {
+        const assignedEvent = [...(session.eventLog || [])]
+          .reverse()
+          .find((event) => event.status === 'ASSIGNED' && Number(event.meta?.etaSeconds) > 0);
+        if (assignedEvent) initialEtaMinutes = Math.max(1, Number(assignedEvent.meta.etaSeconds) / 60);
+      }
+
+      if (!initialEtaMinutes) initialEtaMinutes = 5;
+      await scheduleDelayDetection(session._id, initialEtaMinutes);
+      recovered += 1;
+    }
+
+    if (recovered) logger.info(`Recovered delay monitoring for ${recovered} active session(s)`);
+  } catch (err) {
+    logger.warn(`Failed to recover active delay monitors: ${err.message}`);
+  }
+}
 
 const startServer = async () => {
   await connectDB();
@@ -19,16 +60,16 @@ const startServer = async () => {
     logger.warn(`Failed to sync ambulances to Redis: ${err.message}`);
   }
 
-  // Create HTTP server from Express app
   const httpServer = http.createServer(app);
-
-  // Attach Socket.io to HTTP server
   initSocket(httpServer);
 
-  // Listen on HTTP server, not Express app directly
+  // BullMQ repeatable jobs are recovered for sessions that were already active when
+  // this backend instance started. This makes delay/fallback monitoring restart-safe.
+  await recoverActiveDelayMonitors();
+
   httpServer.listen(PORT, () => {
     logger.info(`RapidAid server running on port ${PORT} in ${process.env.NODE_ENV} mode`);
-    logger.info(`Socket.io ready`);
+    logger.info('Socket.io ready');
   });
 };
 
