@@ -31,14 +31,16 @@ async function scheduleDelayDetection(sessionId, initialEtaMinutes) {
       { sessionId, initialEtaMinutes },
       {
         repeat: { every: process.env.DEMO_MODE === 'true' ? 15000 : 60000 },
-        jobId: `delay:${sessionId}`,
+        // BullMQ custom job ids cannot contain ':'. Keep the readable colon in the
+        // repeatable job name, but use a safe id for the underlying job.
+        jobId: `delay-${sessionId}`,
         attempts: 3,
         backoff: { type: 'exponential', delay: 1000 },
       }
     );
     logger.info(`Delay detection scheduled for ${sessionId}`);
   } catch (err) {
-    logger.error(`Failed to schedule delay detection: ${sessionId}`, err.message);
+    logger.error(`Failed to schedule delay detection for ${sessionId}: ${err.message}`);
   }
 }
 
@@ -49,7 +51,7 @@ async function cancelDelayDetection(sessionId) {
     if (job) await delayQueue.removeRepeatableByKey(job.key);
     await redis.del(`session:${sessionId}:last_movement_at`);
   } catch (err) {
-    logger.error(`Failed to cancel delay detection: ${sessionId}`, err.message);
+    logger.error(`Failed to cancel delay detection: ${sessionId} | ${err.message}`);
   }
 }
 
@@ -91,7 +93,7 @@ const worker = new Worker(
   { connection, concurrency: 5 }
 );
 
-worker.on('failed', (job, err) => logger.error(`Delay worker job failed: ${job?.id}`, err.message));
+worker.on('failed', (job, err) => logger.error(`Delay worker job failed: ${job?.id} | ${err.message}`));
 worker.on('error', (err) => logger.error(`Delay worker error: ${err.message}`));
 
 async function handleDelay(sessionId, data) {
