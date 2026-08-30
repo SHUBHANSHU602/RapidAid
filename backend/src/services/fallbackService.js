@@ -45,7 +45,6 @@ async function fallbackLevel1(session, currentEta) {
     const freshEta = await getSingleETA(dLat, dLng, pLat, pLng);
     const navigationUrl = mapsLink(dLat, dLng, pLat, pLng);
 
-    // Even if ETA is not better, surface a reroute suggestion to the driver first.
     const ambulance = await Ambulance.findById(session.ambulanceId).lean();
     if (ambulance?.driverId) {
       emitToRoom(`driver:${ambulance.driverId}`, 'reroute_suggested', {
@@ -56,12 +55,7 @@ async function fallbackLevel1(session, currentEta) {
         message: 'Delay detected. Re-open navigation to request the latest traffic-aware route.',
       });
     }
-    emitToRoom(`session:${session._id}`, 'reroute_suggested', {
-      sessionId: session._id,
-      currentEta,
-      freshEta,
-      navigationUrl,
-    });
+    emitToRoom(`session:${session._id}`, 'reroute_suggested', { sessionId: session._id, currentEta, freshEta, navigationUrl });
 
     const liveSession = await EmergencySession.findById(session._id);
     liveSession.addEvent('REROUTE_SUGGESTED', { previousEta: currentEta, freshEta, navigationUrl });
@@ -98,11 +92,27 @@ async function reserveReplacement(ambulanceId) {
     local status = redis.call('GET', KEYS[1])
     if status ~= 'AVAILABLE' then return 0 end
     if redis.call('SISMEMBER', KEYS[2], ARGV[1]) == 0 then return 0 end
+    if redis.call('SISMEMBER', KEYS[3], ARGV[1]) == 0 then return 0 end
     redis.call('SET', KEYS[1], 'BUSY')
     redis.call('SREM', KEYS[2], ARGV[1])
     return 1
   `;
-  return (await redis.eval(lua, 2, `ambulance:${id}:status`, 'ambulance:available', id)) === 1;
+  return (await redis.eval(
+    lua,
+    3,
+    `ambulance:${id}:status`,
+    'ambulance:available',
+    'ambulance:online',
+    id
+  )) === 1;
+}
+
+async function releaseReplacement(ambulanceId) {
+  const id = ambulanceId.toString();
+  const pipeline = redis.pipeline();
+  pipeline.set(`ambulance:${id}:status`, 'AVAILABLE');
+  pipeline.sadd('ambulance:available', id);
+  await pipeline.exec();
 }
 
 async function fallbackLevel2(session, currentEta) {
@@ -128,13 +138,21 @@ async function fallbackLevel2(session, currentEta) {
       if (!(await reserveReplacement(candidate.ambulanceId))) continue;
 
       const liveSession = await EmergencySession.findById(session._id);
-      if (!liveSession || ['RESOLVED', 'CANCELLED'].includes(liveSession.status)) return { improved: false };
+      if (!liveSession || ['RESOLVED', 'CANCELLED'].includes(liveSession.status)) {
+        await releaseReplacement(candidate.ambulanceId);
+        return { improved: false };
+      }
 
       const previousAmbulanceId = liveSession.ambulanceId;
       const [oldAmbulance, newAmbulance] = await Promise.all([
         Ambulance.findById(previousAmbulanceId),
         Ambulance.findById(candidate.ambulanceId),
       ]);
+
+      if (!newAmbulance) {
+        await releaseReplacement(candidate.ambulanceId);
+        continue;
+      }
 
       liveSession.ambulanceId = candidate.ambulanceId;
       liveSession.status = 'ASSIGNED';
@@ -149,10 +167,8 @@ async function fallbackLevel2(session, currentEta) {
         oldAmbulance.status = 'AVAILABLE';
         oldAmbulance.assignedSessionId = null;
       }
-      if (newAmbulance) {
-        newAmbulance.status = 'BUSY';
-        newAmbulance.assignedSessionId = session._id;
-      }
+      newAmbulance.status = 'BUSY';
+      newAmbulance.assignedSessionId = session._id;
 
       const pipeline = redis.pipeline();
       pipeline.set(`ambulance:${previousAmbulanceId}:status`, 'AVAILABLE');
@@ -162,8 +178,8 @@ async function fallbackLevel2(session, currentEta) {
 
       await Promise.all([
         liveSession.save(),
-        oldAmbulance?.save(),
-        newAmbulance?.save(),
+        oldAmbulance ? oldAmbulance.save() : Promise.resolve(),
+        newAmbulance.save(),
         pipeline.exec(),
       ]);
 
@@ -181,7 +197,7 @@ async function fallbackLevel2(session, currentEta) {
           reason: 'A closer ambulance was available.',
         });
       }
-      if (newAmbulance?.driverId) {
+      if (newAmbulance.driverId) {
         emitToRoom(`driver:${newAmbulance.driverId}`, 'driver_assignment', {
           sessionId: session._id,
           emergencyType: session.emergencyType,
