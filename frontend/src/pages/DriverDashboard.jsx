@@ -6,6 +6,21 @@ import LocationEmitter from '../components/features/Driver/LocationEmitter';
 import api from '../services/api';
 import { useJoinAsDriver, useSocketEvent } from '../hooks/useSocket';
 
+function getCurrentPosition() {
+  return new Promise((resolve, reject) => {
+    if (!navigator.geolocation) {
+      reject(new Error('Geolocation is not supported by this browser'));
+      return;
+    }
+
+    navigator.geolocation.getCurrentPosition(resolve, reject, {
+      enableHighAccuracy: true,
+      timeout: 10000,
+      maximumAge: 0,
+    });
+  });
+}
+
 export default function DriverDashboard() {
   const [ambulance, setAmbulance] = useState(null);
   const [assignment, setAssignment] = useState(null);
@@ -14,19 +29,32 @@ export default function DriverDashboard() {
   const [driverPosition, setDriverPosition] = useState(null);
   const [alert, setAlert] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [changingStatus, setChangingStatus] = useState(false);
 
   const loadDriverState = useCallback(async () => {
     try {
-      const [ambRes, activeRes] = await Promise.all([
-        api.get('/ambulances/me'),
-        api.get('/ambulances/me/active-session'),
-      ]);
-      const amb = ambRes.data.data;
-      setAmbulance(amb);
-      setIsOnline((amb.liveStatus || amb.status) === 'AVAILABLE');
-      if (activeRes.data.data) {
-        setAssignment(activeRes.data.data);
-        setEtaMinutes(activeRes.data.data?.etaMinutes || null);
+      let amb = null;
+      try {
+        const ambRes = await api.get('/ambulances/me');
+        amb = ambRes.data.data;
+        setAmbulance(amb);
+        setIsOnline((amb.liveStatus || amb.status) === 'AVAILABLE');
+      } catch (err) {
+        if (err.response?.status !== 404) throw err;
+        setAmbulance(null);
+        setIsOnline(false);
+      }
+
+      if (amb) {
+        try {
+          const activeRes = await api.get('/ambulances/me/active-session');
+          if (activeRes.data.data) {
+            setAssignment(activeRes.data.data);
+            setEtaMinutes(activeRes.data.data?.etaMinutes || null);
+          }
+        } catch (err) {
+          if (err.response?.status !== 404) throw err;
+        }
       }
     } finally {
       setLoading(false);
@@ -84,10 +112,55 @@ export default function DriverDashboard() {
   }, []), []);
 
   const toggleOnline = async () => {
-    if (!ambulance) return;
-    const next = isOnline ? 'OFFLINE' : 'AVAILABLE';
-    await api.patch(`/ambulances/${ambulance._id}/status`, { status: next });
-    setIsOnline(!isOnline);
+    if (changingStatus || assignment) return;
+    setChangingStatus(true);
+
+    try {
+      if (isOnline) {
+        if (!ambulance) return;
+        await api.patch(`/ambulances/${ambulance._id}/status`, { status: 'OFFLINE' });
+        setIsOnline(false);
+        setAlert('You are offline and will not receive new emergencies.');
+        return;
+      }
+
+      setAlert('Getting your live GPS location…');
+      const position = await getCurrentPosition();
+      const lat = position.coords.latitude;
+      const lng = position.coords.longitude;
+      setDriverPosition({ lat, lng });
+
+      const provisionRes = await api.post('/ambulances/me/provision', { lat, lng });
+      const linkedAmbulance = provisionRes.data.data;
+      setAmbulance(linkedAmbulance);
+      setIsOnline(true);
+
+      try {
+        const activeRes = await api.get('/ambulances/me/active-session');
+        if (activeRes.data.data) {
+          setAssignment(activeRes.data.data);
+          setEtaMinutes(provisionRes.data.assignment?.etaSeconds
+            ? Math.ceil(provisionRes.data.assignment.etaSeconds / 60)
+            : null);
+          setAlert('You are online. A pending emergency has been assigned to you.');
+        } else {
+          setAlert('You are online and available for emergency assignments.');
+        }
+      } catch {
+        setAlert(provisionRes.data.message || 'You are online and available for emergency assignments.');
+      }
+    } catch (err) {
+      const geoMessage = err?.code === 1
+        ? 'Location permission was denied. Allow location access and click Go Online again.'
+        : err?.code === 2
+          ? 'Your current location could not be determined.'
+          : err?.code === 3
+            ? 'Getting your GPS location timed out. Try again.'
+            : null;
+      setAlert(geoMessage || err.response?.data?.message || err.message || 'Unable to change driver status');
+    } finally {
+      setChangingStatus(false);
+    }
   };
 
   const startTrip = async () => {
@@ -118,10 +191,16 @@ export default function DriverDashboard() {
         <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
           <div>
             <h1 className="text-3xl font-bold text-text-primary">Driver Command Center</h1>
-            <p className="text-text-muted">{ambulance ? `Ambulance ${ambulance._id}` : 'No linked ambulance'}</p>
+            <p className="text-text-muted">
+              {ambulance ? `Ambulance ${ambulance._id}` : 'No linked ambulance yet — Go Online will create/link one using your current GPS'}
+            </p>
           </div>
-          <Button variant={isOnline ? 'danger' : 'success'} onClick={toggleOnline} disabled={!!assignment}>
-            {isOnline ? 'Go Offline' : 'Go Online'}
+          <Button
+            variant={isOnline ? 'danger' : 'success'}
+            onClick={toggleOnline}
+            disabled={!!assignment || changingStatus}
+          >
+            {changingStatus ? 'Please wait…' : isOnline ? 'Go Offline' : 'Go Online'}
           </Button>
         </div>
 
@@ -133,7 +212,9 @@ export default function DriverDashboard() {
 
         {!assignment ? (
           <div className="glass p-12 text-center text-text-muted">
-            {isOnline ? 'Online — waiting for the dispatch engine to assign an emergency.' : 'Go online to become eligible for assignments.'}
+            {isOnline
+              ? 'Online — waiting for the dispatch engine to assign an emergency.'
+              : 'Click Go Online. RapidAid will use your current GPS and make this driver eligible for assignments.'}
           </div>
         ) : (
           <div className="grid lg:grid-cols-[380px_1fr] gap-4 min-h-[70vh]">
