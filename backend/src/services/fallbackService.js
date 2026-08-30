@@ -24,6 +24,11 @@ function getEscalationGraceSeconds() {
   return process.env.DEMO_MODE === 'true' ? 30 : 120;
 }
 
+function getLateReplacementRetrySeconds() {
+  if (process.env.FALLBACK_RETRY_SECONDS) return Number(process.env.FALLBACK_RETRY_SECONDS);
+  return process.env.DEMO_MODE === 'true' ? 30 : 60;
+}
+
 function stageKey(sessionId) {
   return `session:${sessionId}:fallback_stage`;
 }
@@ -51,6 +56,7 @@ async function triggerFallback(sessionId, currentEta, context = {}) {
   const reason = context.reason || [...(session.eventLog || [])]
     .reverse()
     .find((event) => event.status === 'DELAYED')?.meta?.reason || 'ETA_DRIFT';
+  const stalled = reason === 'AMBULANCE_STALLED';
 
   // Stage 1 always gives the current driver a reroute opportunity first.
   if (!stage) {
@@ -75,7 +81,7 @@ async function triggerFallback(sessionId, currentEta, context = {}) {
       return { stage, waiting: true, ageSeconds, graceSeconds };
     }
 
-    const l2 = await fallbackLevel2(session, currentEta, { stalled: reason === 'AMBULANCE_STALLED' });
+    const l2 = await fallbackLevel2(session, currentEta, { stalled });
     if (l2.improved) {
       await setFallbackStage(sessionId, 'AMBULANCE_SWAPPED');
       return { stage: 'AMBULANCE_SWAPPED', ...l2 };
@@ -87,7 +93,29 @@ async function triggerFallback(sessionId, currentEta, context = {}) {
     return { stage: 'AI_AND_HOSPITAL_ESCALATED', improved: false };
   }
 
-  // Prevent AI/webhook spam on every recurring delay check.
+  // AI/hospital escalation is not the end of the dispatch search. A replacement
+  // driver can come online later, so periodically retry L2 without repeating AI/webhook.
+  if (stage === 'AI_AND_HOSPITAL_ESCALATED') {
+    const stageAt = Number(await redis.get(stageAtKey(sessionId))) || Date.now();
+    const ageSeconds = Math.floor((Date.now() - stageAt) / 1000);
+    const retrySeconds = getLateReplacementRetrySeconds();
+
+    if (ageSeconds < retrySeconds) {
+      return { stage, waitingForReplacement: true, ageSeconds, retrySeconds };
+    }
+
+    const l2 = await fallbackLevel2(session, currentEta, { stalled });
+    if (l2.improved) {
+      await setFallbackStage(sessionId, 'AMBULANCE_SWAPPED');
+      logger.info(`Late replacement found after escalation session=${sessionId}`);
+      return { stage: 'AMBULANCE_SWAPPED', ...l2 };
+    }
+
+    await setFallbackStage(sessionId, 'AI_AND_HOSPITAL_ESCALATED');
+    logger.debug(`No late replacement yet session=${sessionId}; retrying in ${retrySeconds}s`);
+    return { stage, waitingForReplacement: true, retrySeconds };
+  }
+
   return { stage, repeated: true };
 }
 
@@ -285,6 +313,15 @@ async function fallbackLevel2(session, currentEta, { stalled = false } = {}) {
         newAmbulanceId: candidate.ambulanceId,
         newEta: candidate.eta,
         message: 'The delayed ambulance was replaced with another available ambulance.',
+      });
+      // Reuse the normal patient assignment event so existing tracking UI updates
+      // ambulance id and ETA immediately after a swap.
+      emitToRoom(`session:${session._id}`, 'ambulance_assigned', {
+        sessionId: session._id,
+        ambulanceId: candidate.ambulanceId,
+        etaMinutes: candidate.eta,
+        etaSeconds: candidate.eta * 60,
+        swapped: true,
       });
 
       if (oldAmbulance?.driverId) {
