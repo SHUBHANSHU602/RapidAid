@@ -9,6 +9,44 @@ const {
   setAmbulanceOnline,
 } = require('../services/ambulanceCache');
 
+const DEMO_STALE_SESSION_MS = 15 * 60 * 1000;
+
+function demoCutoff() {
+  return new Date(Date.now() - DEMO_STALE_SESSION_MS);
+}
+
+function isStaleDemoSession(session) {
+  return process.env.DEMO_MODE === 'true'
+    && session?.createdAt
+    && new Date(session.createdAt) < demoCutoff();
+}
+
+async function cancelStaleDemoSession(session, ambulanceId = null) {
+  if (!isStaleDemoSession(session)) return false;
+
+  await EmergencySession.findByIdAndUpdate(session._id, {
+    status: 'CANCELLED',
+    $push: {
+      eventLog: {
+        status: 'CANCELLED',
+        timestamp: new Date(),
+        meta: {
+          previousStatus: session.status,
+          reason: 'DEMO_STALE_SESSION_CLEANUP',
+        },
+      },
+    },
+  });
+
+  if (ambulanceId) {
+    await Ambulance.findByIdAndUpdate(ambulanceId, {
+      assignedSessionId: null,
+    });
+  }
+
+  return true;
+}
+
 function createServiceArea(lat, lng, size = 0.05) {
   return {
     type: 'Polygon',
@@ -23,10 +61,40 @@ function createServiceArea(lat, lng, size = 0.05) {
 }
 
 async function dispatchOldestPendingEmergency() {
-  const pending = await EmergencySession.findOne({
+  const query = {
     status: 'INITIATED',
     ambulanceId: null,
-  }).sort({ createdAt: 1 }).lean();
+  };
+
+  if (process.env.DEMO_MODE === 'true') {
+    const cutoff = demoCutoff();
+
+    await EmergencySession.updateMany(
+      {
+        ...query,
+        createdAt: { $lt: cutoff },
+      },
+      {
+        $set: { status: 'CANCELLED' },
+        $push: {
+          eventLog: {
+            status: 'CANCELLED',
+            timestamp: new Date(),
+            meta: {
+              previousStatus: 'INITIATED',
+              reason: 'DEMO_STALE_SESSION_CLEANUP',
+            },
+          },
+        },
+      }
+    );
+
+    query.createdAt = { $gte: cutoff };
+  }
+
+  const pending = await EmergencySession.findOne(query)
+    .sort({ createdAt: 1 })
+    .lean();
 
   if (!pending) return null;
 
@@ -89,15 +157,19 @@ exports.provisionMyAmbulance = async (req, res, next) => {
     if (ambulance?.assignedSessionId) {
       const active = await EmergencySession.findById(ambulance.assignedSessionId).lean();
       if (active && ['ASSIGNED', 'EN_ROUTE', 'DELAYED'].includes(active.status)) {
-        await updateAmbulanceLocation(ambulance._id, lat, lng, true);
-        await setAmbulanceOnline(ambulance._id, true);
-        const populated = await Ambulance.findById(ambulance._id).populate('driverId', 'name email');
-        return res.status(200).json({
-          success: true,
-          message: 'Driver is online and already has an active assignment',
-          data: { ...populated.toObject(), liveStatus: populated.status },
-          assignment: { sessionId: active._id },
-        });
+        const staleDemoSession = await cancelStaleDemoSession(active, ambulance._id);
+
+        if (!staleDemoSession) {
+          await updateAmbulanceLocation(ambulance._id, lat, lng, true);
+          await setAmbulanceOnline(ambulance._id, true);
+          const populated = await Ambulance.findById(ambulance._id).populate('driverId', 'name email');
+          return res.status(200).json({
+            success: true,
+            message: 'Driver is online and already has an active assignment',
+            data: { ...populated.toObject(), liveStatus: populated.status },
+            assignment: { sessionId: active._id },
+          });
+        }
       }
     }
 
@@ -145,10 +217,18 @@ exports.getMyActiveSession = async (req, res, next) => {
     const ambulance = await Ambulance.findOne({ driverId: req.user.userId }).lean();
     if (!ambulance) return next(new AppError('No ambulance is linked to this driver account', 404));
 
-    const session = await EmergencySession.findOne({
+    const activeQuery = {
       ambulanceId: ambulance._id,
       status: { $in: ['ASSIGNED', 'EN_ROUTE', 'DELAYED'] },
-    }).sort({ createdAt: -1 }).populate('hospitalId', 'name location address');
+    };
+
+    if (process.env.DEMO_MODE === 'true') {
+      activeQuery.createdAt = { $gte: demoCutoff() };
+    }
+
+    const session = await EmergencySession.findOne(activeQuery)
+      .sort({ createdAt: -1 })
+      .populate('hospitalId', 'name location address');
 
     if (!session) {
       return res.status(200).json({ success: true, data: null });
@@ -212,7 +292,10 @@ exports.updateAmbulanceStatus = async (req, res, next) => {
     if (status === 'AVAILABLE' && ambulance.assignedSessionId) {
       const active = await EmergencySession.findById(ambulance.assignedSessionId).lean();
       if (active && ['ASSIGNED', 'EN_ROUTE', 'DELAYED'].includes(active.status)) {
-        return next(new AppError('Cannot become AVAILABLE while assigned to an active emergency', 409));
+        const staleDemoSession = await cancelStaleDemoSession(active, ambulance._id);
+        if (!staleDemoSession) {
+          return next(new AppError('Cannot become AVAILABLE while assigned to an active emergency', 409));
+        }
       }
     }
 
