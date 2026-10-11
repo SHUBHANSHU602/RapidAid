@@ -1,7 +1,9 @@
 const jwt = require('jsonwebtoken');
 const { createAdapter } = require('@socket.io/redis-adapter');
 const EmergencySession = require('../models/EmergencySession');
+const Ambulance = require('../models/Ambulance');
 const { haversineDistance, getSingleETA } = require('../services/mapsService');
+const { updateAmbulanceLocation, setAmbulanceOnline } = require('../services/ambulanceCache');
 const redis = require('../config/redis');
 const logger = require('../utils/logger');
 
@@ -10,105 +12,92 @@ const etaIntervals = new Map();
 
 function initSocket(server) {
   const { Server } = require('socket.io');
-  const allowedOrigin = process.env.CLIENT_URL || 'http://localhost:3000';
-
   io = new Server(server, {
     cors: {
-      origin: '*',
+      origin: process.env.CLIENT_URL ? process.env.CLIENT_URL.split(',').map((s) => s.trim()) : '*',
       methods: ['GET', 'POST'],
       credentials: true,
     },
   });
 
-  // ── Redis adapter for horizontal scaling ──────────────────────────────────
-  // Creates a pub/sub channel between multiple server instances
-  // Any instance can emit to any room — Redis routes it correctly
   const Redis = require('ioredis');
-
   try {
-    const pubClient = new Redis(process.env.REDIS_URL, {
-      maxRetriesPerRequest: null,
-      enableReadyCheck: false,
-    });
+    const pubClient = new Redis(process.env.REDIS_URL, { maxRetriesPerRequest: null, enableReadyCheck: false });
     const subClient = pubClient.duplicate();
-
-    pubClient.on('error', (err) => {
-      logger.warn(`Socket.io Redis pubClient error: ${err.message}`);
-    });
-    subClient.on('error', (err) => {
-      logger.warn(`Socket.io Redis subClient error: ${err.message}`);
-    });
-
+    pubClient.on('error', (err) => logger.warn(`Socket Redis pub error: ${err.message}`));
+    subClient.on('error', (err) => logger.warn(`Socket Redis sub error: ${err.message}`));
     io.adapter(createAdapter(pubClient, subClient));
-    logger.info('Socket.io Redis adapter initialized — horizontal scaling enabled');
   } catch (err) {
-    logger.warn('Socket.io Redis adapter failed — running single instance mode', err.message);
+    logger.warn(`Socket Redis adapter unavailable; single-instance mode: ${err.message}`);
   }
 
-  // ── JWT middleware ────────────────────────────────────────────────────────
   io.use((socket, next) => {
     try {
       let token = socket.handshake.auth?.token;
-      if (!token) {
-        const authHeader = socket.handshake.headers?.authorization;
-        if (authHeader?.startsWith('Bearer ')) {
-          token = authHeader.slice(7).trim();
-        }
+      if (!token && socket.handshake.headers?.authorization?.startsWith('Bearer ')) {
+        token = socket.handshake.headers.authorization.slice(7).trim();
       }
       if (!token) return next(new Error('Authentication required'));
-      const decoded = jwt.verify(token, process.env.JWT_SECRET);
-      socket.user = decoded;
+      socket.user = jwt.verify(token, process.env.JWT_SECRET);
       next();
     } catch (err) {
       next(new Error('Invalid token'));
     }
   });
 
-  io.on('connection', (socket) => {
-    logger.info(`Socket connected: ${socket.id} | user: ${socket.user.userId} | role: ${socket.user.role}`);
+  io.on('connection', async (socket) => {
+    const role = socket.user.role.toLowerCase();
+    logger.info(`Socket connected ${socket.id} user=${socket.user.userId} role=${role}`);
 
-    // ── Patient joins session room ─────────────────────────────────────────
+    if (role === 'driver') {
+      socket.join(`driver:${socket.user.userId}`);
+      try {
+        const ambulance = await Ambulance.findOne({ driverId: socket.user.userId }).lean();
+        if (ambulance) {
+          socket.ambulanceId = ambulance._id.toString();
+          if (ambulance.status === 'AVAILABLE') await setAmbulanceOnline(socket.ambulanceId, true);
+        }
+      } catch (err) {
+        logger.warn(`Failed to resolve driver's ambulance: ${err.message}`);
+      }
+    }
+
     socket.on('join_session', async ({ sessionId }) => {
       try {
         const session = await EmergencySession.findById(sessionId).lean();
         if (!session) return socket.emit('error', { message: 'Session not found' });
-
-        const isOwner = session.userId.toString() === socket.user.userId;
-        const isAdmin = socket.user.role.toLowerCase() === 'admin';
-
-        if (!isOwner && !isAdmin) {
-          return socket.emit('error', { message: 'Not authorized' });
-        }
-
+        const isOwner = session.userId.toString() === socket.user.userId.toString();
+        const isAdmin = role === 'admin';
+        if (!isOwner && !isAdmin) return socket.emit('error', { message: 'Not authorized' });
         socket.join(`session:${sessionId}`);
         socket.emit('joined_session', { sessionId });
-        logger.info(`Patient ${socket.user.userId} joined room session:${sessionId}`);
       } catch (err) {
-        logger.error('join_session error', err);
         socket.emit('error', { message: 'Failed to join session' });
       }
     });
 
-    // ── Driver joins session room ──────────────────────────────────────────
     socket.on('join_as_driver', async ({ sessionId }) => {
       try {
-        const role = socket.user.role.toLowerCase();
-        if (role !== 'driver' && role !== 'admin') {
-          return socket.emit('error', { message: 'Driver role required' });
-        }
-
+        if (!['driver', 'admin'].includes(role)) return socket.emit('error', { message: 'Driver role required' });
         const session = await EmergencySession.findById(sessionId).lean();
         if (!session) return socket.emit('error', { message: 'Session not found' });
 
+        if (role === 'driver') {
+          if (!socket.ambulanceId) {
+            const ambulance = await Ambulance.findOne({ driverId: socket.user.userId }).lean();
+            socket.ambulanceId = ambulance?._id?.toString();
+          }
+          if (!socket.ambulanceId || session.ambulanceId?.toString() !== socket.ambulanceId) {
+            return socket.emit('error', { message: 'This emergency is assigned to another ambulance' });
+          }
+        }
+
         socket.join(`session:${sessionId}`);
         socket.currentSessionId = sessionId;
-        socket.patientLocation = {
-          latitude: session.location.lat,
-          longitude: session.location.lng,
-        };
-
-        socket.emit('joined_as_driver', { sessionId });
-        logger.info(`Driver ${socket.user.userId} joined room session:${sessionId}`);
+        socket.patientLocation = { lat: session.location.lat, lng: session.location.lng };
+        await redis.setnx(`session:${sessionId}:last_movement_at`, Date.now().toString());
+        await redis.expire(`session:${sessionId}:last_movement_at`, 7200);
+        socket.emit('joined_as_driver', { sessionId, ambulanceId: socket.ambulanceId });
         startETAInterval(socket, sessionId);
       } catch (err) {
         logger.error('join_as_driver error', err);
@@ -116,82 +105,99 @@ function initSocket(server) {
       }
     });
 
-    // ── Driver location update with delta compression ──────────────────────
     socket.on('location_update', async ({ latitude, longitude }) => {
       try {
-        const role = socket.user.role.toLowerCase();
-        if (role !== 'driver' && role !== 'admin') {
-          return socket.emit('error', { message: 'Driver role required' });
-        }
-        if (!socket.currentSessionId) {
-          return socket.emit('error', { message: 'Join a session first' });
-        }
-        if (
-          typeof latitude !== 'number' || typeof longitude !== 'number' ||
-          latitude < -90 || latitude > 90 ||
-          longitude < -180 || longitude > 180
-        ) {
+        if (!['driver', 'admin'].includes(role)) return socket.emit('error', { message: 'Driver role required' });
+        if (typeof latitude !== 'number' || typeof longitude !== 'number' || latitude < -90 || latitude > 90 || longitude < -180 || longitude > 180) {
           return socket.emit('error', { message: 'Invalid coordinates' });
         }
 
-        const ambulanceKey = `ambulance:${socket.user.userId}:location`;
-        const lastRaw = await redis.get(ambulanceKey);
+        if (!socket.ambulanceId && role === 'driver') {
+          const ambulance = await Ambulance.findOne({ driverId: socket.user.userId }).lean();
+          socket.ambulanceId = ambulance?._id?.toString();
+        }
+        if (!socket.ambulanceId) return socket.emit('error', { message: 'No ambulance linked to this driver' });
 
+        await setAmbulanceOnline(socket.ambulanceId, true);
+
+        const key = `ambulance:${socket.ambulanceId}:location`;
+        const lastRaw = await redis.get(key);
+        let movedMeters = Infinity;
         if (lastRaw) {
           const last = JSON.parse(lastRaw);
-          const distanceKm = haversineDistance(last.latitude, last.longitude, latitude, longitude);
-          if (distanceKm * 1000 < 10) {
-            logger.debug(`Delta compression: driver ${socket.user.userId} moved ${(distanceKm * 1000).toFixed(1)}m — skipped`);
-            return;
-          }
+          const lastLat = last.lat ?? last.latitude;
+          const lastLng = last.lng ?? last.longitude;
+          movedMeters = haversineDistance(lastLat, lastLng, latitude, longitude) * 1000;
         }
 
-        const locationData = { latitude, longitude, timestamp: new Date().toISOString() };
-        await redis.set(ambulanceKey, JSON.stringify(locationData), 'EX', 300);
-        socket.driverLocation = { latitude, longitude };
+        if (movedMeters >= 10) {
+          const locationData = await updateAmbulanceLocation(socket.ambulanceId, latitude, longitude, true);
+          socket.driverLocation = { lat: latitude, lng: longitude };
 
-        io.to(`session:${socket.currentSessionId}`).emit('driver_location', {
-          driverId: socket.user.userId,
-          latitude,
-          longitude,
-          timestamp: locationData.timestamp,
-        });
+          if (socket.currentSessionId) {
+            const sessionId = socket.currentSessionId;
+            await redis.set(`session:${sessionId}:last_movement_at`, Date.now().toString(), 'EX', 7200);
+
+            io.to(`session:${sessionId}`).emit('driver_location', {
+              driverId: socket.user.userId,
+              ambulanceId: socket.ambulanceId,
+              latitude,
+              longitude,
+              timestamp: locationData.updatedAt,
+            });
+
+            // Movement after a stall is a real recovery signal. Resume EN_ROUTE and
+            // clear staged fallback escalation so the trip can be monitored normally.
+            const active = await EmergencySession.findById(sessionId);
+            if (active?.status === 'DELAYED' && active.ambulanceId?.toString() === socket.ambulanceId) {
+              active.status = 'EN_ROUTE';
+              active.addEvent('DELAY_RECOVERED', {
+                recoveredAt: new Date().toISOString(),
+                movedMeters: Math.round(movedMeters),
+              });
+              await active.save();
+              await redis.del(
+                `session:${sessionId}:fallback_stage`,
+                `session:${sessionId}:fallback_stage_at`
+              );
+
+              io.to(`session:${sessionId}`).emit('session_status_changed', {
+                sessionId,
+                oldStatus: 'DELAYED',
+                newStatus: 'EN_ROUTE',
+              });
+              io.to(`session:${sessionId}`).emit('delay_cleared', {
+                sessionId,
+                message: 'Ambulance movement resumed. The current trip is active again.',
+              });
+            }
+          }
+        } else {
+          await redis.expire(key, 300);
+        }
       } catch (err) {
         logger.error('location_update error', err);
         socket.emit('error', { message: 'Failed to process location update' });
       }
     });
 
-    // ── Disconnect ─────────────────────────────────────────────────────────
     socket.on('disconnect', async () => {
-      logger.info(`Socket disconnected: ${socket.id} | user: ${socket.user.userId}`);
-      if (!socket.currentSessionId) return;
-
-      const sessionId = socket.currentSessionId;
-      const userId = socket.user.userId;
-
-      stopETAInterval(sessionId);
-
-      const locationKey = `ambulance:${userId}:location`;
-      const lastLocation = await redis.get(locationKey);
-
-      if (lastLocation) {
-        await redis.expire(locationKey, 300);
-        logger.info(`Driver ${userId} disconnected — location preserved for 5min`);
+      if (socket.ambulanceId) {
+        try { await setAmbulanceOnline(socket.ambulanceId, false); } catch (err) { logger.warn(err.message); }
       }
 
-      const parsedLocation = lastLocation ? JSON.parse(lastLocation) : null;
-
+      if (!socket.currentSessionId) return;
+      const sessionId = socket.currentSessionId;
+      stopETAInterval(sessionId);
+      const key = socket.ambulanceId ? `ambulance:${socket.ambulanceId}:location` : null;
+      const raw = key ? await redis.get(key) : null;
+      if (key && raw) await redis.expire(key, 300);
+      const location = raw ? JSON.parse(raw) : null;
       io.to(`session:${sessionId}`).emit('driver_disconnected', {
-        driverId: userId,
-        sessionId,
-        lastKnownLocation: parsedLocation
-          ? { latitude: parsedLocation.latitude, longitude: parsedLocation.longitude }
-          : null,
+        driverId: socket.user.userId,
+        ambulanceId: socket.ambulanceId,
+        lastKnownLocation: location ? { latitude: location.lat ?? location.latitude, longitude: location.lng ?? location.longitude } : null,
         disconnectedAt: new Date().toISOString(),
-        locationPreservedUntil: parsedLocation
-          ? new Date(Date.now() + 300000).toISOString()
-          : null,
       });
     });
   });
@@ -199,57 +205,40 @@ function initSocket(server) {
   return io;
 }
 
-// ── ETA interval helpers ──────────────────────────────────────────────────────
 function startETAInterval(socket, sessionId) {
-  if (etaIntervals.has(sessionId)) {
-    clearInterval(etaIntervals.get(sessionId));
-  }
+  stopETAInterval(sessionId);
 
-  const intervalId = setInterval(async () => {
+  const calculate = async () => {
     try {
-      const driverLoc = socket.driverLocation || await getDriverLocationFromRedis(socket.user.userId);
-      if (!driverLoc) {
-        logger.debug(`ETA interval: no driver location yet for session ${sessionId}`);
-        return;
+      let driverLoc = socket.driverLocation;
+      if (!driverLoc && socket.ambulanceId) {
+        const raw = await redis.get(`ambulance:${socket.ambulanceId}:location`);
+        if (raw) {
+          const loc = JSON.parse(raw);
+          driverLoc = { lat: loc.lat ?? loc.latitude, lng: loc.lng ?? loc.longitude };
+        }
       }
+      if (!driverLoc || !socket.patientLocation) return;
 
-      const { latitude: dLat, longitude: dLng } = driverLoc;
-      const { latitude: pLat, longitude: pLng } = socket.patientLocation;
-      const etaMinutes = await getSingleETA(dLat, dLng, pLat, pLng);
-
-      const etaKey = `session:${sessionId}:eta`;
-      await redis.set(etaKey, JSON.stringify({
-        etaMinutes,
-        calculatedAt: new Date().toISOString(),
-      }), 'EX', 90);
-
-      io.to(`session:${sessionId}`).emit('eta_update', {
-        sessionId,
-        etaMinutes,
-        calculatedAt: new Date().toISOString(),
-      });
-
-      logger.debug(`ETA updated: session ${sessionId} → ${etaMinutes} min`);
+      const etaMinutes = await getSingleETA(driverLoc.lat, driverLoc.lng, socket.patientLocation.lat, socket.patientLocation.lng);
+      const calculatedAt = new Date().toISOString();
+      await redis.set(`session:${sessionId}:eta`, JSON.stringify({ etaMinutes, calculatedAt }), 'EX', 90);
+      io.to(`session:${sessionId}`).emit('eta_update', { sessionId, etaMinutes, calculatedAt });
     } catch (err) {
-      logger.error(`ETA interval error for session ${sessionId}`, err);
+      logger.error(`ETA calculation failed for ${sessionId}: ${err.message}`);
     }
-  }, 30000);
+  };
 
+  calculate();
+  const intervalId = setInterval(calculate, 30000);
   etaIntervals.set(sessionId, intervalId);
-  logger.info(`ETA interval started for session ${sessionId}`);
 }
 
 function stopETAInterval(sessionId) {
   if (etaIntervals.has(sessionId)) {
     clearInterval(etaIntervals.get(sessionId));
     etaIntervals.delete(sessionId);
-    logger.info(`ETA interval stopped for session ${sessionId}`);
   }
-}
-
-async function getDriverLocationFromRedis(userId) {
-  const raw = await redis.get(`ambulance:${userId}:location`);
-  return raw ? JSON.parse(raw) : null;
 }
 
 function getIO() {

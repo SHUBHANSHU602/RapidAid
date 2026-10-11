@@ -3,9 +3,8 @@ const logger = require('../utils/logger');
 
 const MAPS_API_KEY = process.env.GOOGLE_MAPS_API_KEY;
 
-// Haversine formula — straight-line distance between two coordinates in km
 function haversineDistance(lat1, lng1, lat2, lng2) {
-  const R = 6371; // Earth radius in km
+  const R = 6371;
   const dLat = ((lat2 - lat1) * Math.PI) / 180;
   const dLng = ((lng2 - lng1) * Math.PI) / 180;
   const a =
@@ -16,78 +15,90 @@ function haversineDistance(lat1, lng1, lat2, lng2) {
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
-// Fetch real ETAs from Google Maps Distance Matrix API
-async function getETAs(originCoords, destinations) {
-  if (!MAPS_API_KEY) {
-    // Fallback: estimate ETA from haversine (assume 30km/h avg speed in city)
-    logger.warn('No Google Maps API key — using haversine ETA estimate');
-    return destinations.map((dest) => {
-      const distKm = haversineDistance(
-        originCoords.lat, originCoords.lng,
-        dest.lat, dest.lng
-      );
-      return Math.round((distKm / 30) * 60 * 60); // seconds
-    });
-  }
-
-  const origins = `${originCoords.lat},${originCoords.lng}`;
-  const destinationStr = destinations
-    .map((d) => `${d.lat},${d.lng}`)
-    .join('|');
-
-  const url = `https://maps.googleapis.com/maps/api/distancematrix/json`;
-
-  const response = await axios.get(url, {
-    params: {
-      origins,
-      destinations: destinationStr,
-      key: MAPS_API_KEY,
-      mode: 'driving',
-      traffic_model: 'best_guess',
-      departure_time: 'now',
-    },
-    timeout: 5000, // 5s hard timeout
-  });
-
-  const rows = response.data.rows[0]?.elements || [];
-  return rows.map((el) => {
-    if (el.status !== 'OK') return Infinity;
-    return el.duration_in_traffic?.value || el.duration?.value || Infinity;
-  });
+function fallbackEtaSeconds(from, to) {
+  const distKm = haversineDistance(from.lat, from.lng, to.lat, to.lng);
+  return Math.round((distKm / 30) * 60 * 60);
 }
-/**
- * Get ETA in minutes between two lat/lng points.
- * Uses Google Maps API if key present, haversine fallback at 30km/h otherwise.
- * @param {number} fromLat
- * @param {number} fromLng
- * @param {number} toLat
- * @param {number} toLng
- * @returns {Promise<number>} ETA in minutes
- */
+
+// Kept for compatibility: one origin -> many destinations.
+async function getETAs(originCoords, destinations) {
+  if (!MAPS_API_KEY) return destinations.map((dest) => fallbackEtaSeconds(originCoords, dest));
+
+  try {
+    const response = await axios.get('https://maps.googleapis.com/maps/api/distancematrix/json', {
+      params: {
+        origins: `${originCoords.lat},${originCoords.lng}`,
+        destinations: destinations.map((d) => `${d.lat},${d.lng}`).join('|'),
+        key: MAPS_API_KEY,
+        mode: 'driving',
+        traffic_model: 'best_guess',
+        departure_time: 'now',
+      },
+      timeout: 5000,
+    });
+
+    const elements = response.data.rows?.[0]?.elements || [];
+    return destinations.map((dest, index) => {
+      const el = elements[index];
+      return el?.status === 'OK' ? (el.duration_in_traffic?.value || el.duration?.value) : fallbackEtaSeconds(originCoords, dest);
+    });
+  } catch (err) {
+    logger.warn(`Google Maps batch ETA failed: ${err.message}`);
+    return destinations.map((dest) => fallbackEtaSeconds(originCoords, dest));
+  }
+}
+
+// Correct dispatch direction: many ambulance origins -> one patient destination.
+async function getETAsToDestination(origins, destination) {
+  if (!MAPS_API_KEY) return origins.map((origin) => fallbackEtaSeconds(origin, destination));
+
+  try {
+    const response = await axios.get('https://maps.googleapis.com/maps/api/distancematrix/json', {
+      params: {
+        origins: origins.map((o) => `${o.lat},${o.lng}`).join('|'),
+        destinations: `${destination.lat},${destination.lng}`,
+        key: MAPS_API_KEY,
+        mode: 'driving',
+        traffic_model: 'best_guess',
+        departure_time: 'now',
+      },
+      timeout: 5000,
+    });
+
+    return origins.map((origin, index) => {
+      const el = response.data.rows?.[index]?.elements?.[0];
+      return el?.status === 'OK' ? (el.duration_in_traffic?.value || el.duration?.value) : fallbackEtaSeconds(origin, destination);
+    });
+  } catch (err) {
+    logger.warn(`Google Maps dispatch ETA failed: ${err.message}`);
+    return origins.map((origin) => fallbackEtaSeconds(origin, destination));
+  }
+}
+
 async function getSingleETA(fromLat, fromLng, toLat, toLng) {
-  if (process.env.GOOGLE_MAPS_API_KEY) {
+  if (MAPS_API_KEY) {
     try {
-      const url =
-        `https://maps.googleapis.com/maps/api/distancematrix/json` +
-        `?origins=${fromLat},${fromLng}` +
-        `&destinations=${toLat},${toLng}` +
-        `&key=${process.env.GOOGLE_MAPS_API_KEY}`;
-
-      const res = await fetch(url);
-      const data = await res.json();
-      const element = data.rows?.[0]?.elements?.[0];
-
+      const response = await axios.get('https://maps.googleapis.com/maps/api/distancematrix/json', {
+        params: {
+          origins: `${fromLat},${fromLng}`,
+          destinations: `${toLat},${toLng}`,
+          key: MAPS_API_KEY,
+          mode: 'driving',
+          traffic_model: 'best_guess',
+          departure_time: 'now',
+        },
+        timeout: 5000,
+      });
+      const element = response.data.rows?.[0]?.elements?.[0];
       if (element?.status === 'OK') {
-        return Math.ceil(element.duration.value / 60); // seconds → minutes
+        return Math.ceil((element.duration_in_traffic?.value || element.duration.value) / 60);
       }
     } catch (err) {
-      logger.warn('Google Maps API failed, falling back to haversine', err.message);
+      logger.warn(`Google Maps API failed, using haversine: ${err.message}`);
     }
   }
 
-  // Haversine fallback — assume 30 km/h average speed
-  const distanceKm = haversineDistance(fromLat, fromLng, toLat, toLng);
-  return Math.ceil((distanceKm / 30) * 60); // minutes
+  return Math.ceil((haversineDistance(fromLat, fromLng, toLat, toLng) / 30) * 60);
 }
 
-module.exports = { haversineDistance, getETAs, getSingleETA };
+module.exports = { haversineDistance, getETAs, getETAsToDestination, getSingleETA };

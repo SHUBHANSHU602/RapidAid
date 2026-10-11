@@ -15,16 +15,26 @@ export function useSocketEvent(event, handler, deps = []) {
 
 export function useJoinSession(sessionId) {
   useEffect(() => {
-    if (!sessionId) return;
+    if (!sessionId) return undefined;
     const socket = getSocket();
-    socket.emit('join_session', { sessionId });
+    const join = () => socket.emit('join_session', { sessionId });
+
+    if (socket.connected) join();
+    socket.on('connect', join);
+
+    return () => socket.off('connect', join);
   }, [sessionId]);
 }
 
 export function useJoinAsDriver(sessionId) {
   useEffect(() => {
-    if (!sessionId) return;
+    if (!sessionId) return undefined;
     const socket = getSocket();
-    socket.emit('join_as_driver', { sessionId });
+    const join = () => socket.emit('join_as_driver', { sessionId });
+
+    if (socket.connected) join();
+    socket.on('connect', join);
+
+    return () => socket.off('connect', join);
   }, [sessionId]);
 }

@@ -8,172 +8,174 @@ const EmergencySession = require('../models/EmergencySession');
 const logger = require('../utils/logger');
 
 const connection = getBullMQConnection();
-
-// Create queue
 const delayQueue = new Queue('delay-detection', { connection });
-
-// Queue events for monitoring
 const queueEvents = new QueueEvents('delay-detection', { connection });
 
-queueEvents.on('failed', ({ jobId, failedReason }) => {
-  logger.error(`Delay job failed: ${jobId} | ${failedReason}`);
-});
+queueEvents.on('failed', ({ jobId, failedReason }) => logger.error(`Delay job failed: ${jobId} | ${failedReason}`));
 
-/**
- * Schedule a repeating delay detection job for a session.
- * @param {string} sessionId
- * @param {number} initialEtaMinutes
- */
+function getStallThresholdSeconds() {
+  if (process.env.STALL_THRESHOLD_SECONDS) return Number(process.env.STALL_THRESHOLD_SECONDS);
+  return process.env.DEMO_MODE === 'true' ? 30 : 120;
+}
+
+function schedulerIdFor(sessionId) {
+  return `delay-${sessionId}`;
+}
+
 async function scheduleDelayDetection(sessionId, initialEtaMinutes) {
   try {
-    // Remove existing job first to avoid duplicates
-    const existingJobs = await delayQueue.getRepeatableJobs();
-    const existing = existingJobs.find(j => j.name === `delay:${sessionId}`);
-    if (existing) {
-      await delayQueue.removeRepeatableByKey(existing.key);
-    }
+    const schedulerId = schedulerIdFor(sessionId);
+    const every = process.env.DEMO_MODE === 'true' ? 15000 : 60000;
 
-    await delayQueue.add(
-      `delay:${sessionId}`,
-      { sessionId, initialEtaMinutes },
+    await delayQueue.upsertJobScheduler(
+      schedulerId,
+      { every },
       {
-        repeat: { every: 60000 },
-        jobId: `delay:${sessionId}`,
+        name: `delay:${sessionId}`,
+        data: { sessionId: sessionId.toString(), initialEtaMinutes: Number(initialEtaMinutes) || 5 },
+        opts: {
+          attempts: 3,
+          backoff: { type: 'exponential', delay: 1000 },
+          removeOnComplete: 20,
+          removeOnFail: 50,
+        },
       }
     );
 
-    logger.info(`Delay detection scheduled: session ${sessionId} | initial ETA: ${initialEtaMinutes}min`);
+    // Do not reset an existing movement clock during backend recovery.
+    const movementKey = `session:${sessionId}:last_movement_at`;
+    await redis.setnx(movementKey, Date.now().toString());
+    await redis.expire(movementKey, 7200);
+
+    logger.info(`Delay detection scheduled for ${sessionId} every ${every / 1000}s`);
+    return true;
   } catch (err) {
-    logger.error(`Failed to schedule delay detection: ${sessionId}`, err.message);
+    logger.error(`Failed to schedule delay detection for ${sessionId}: ${err.message}`);
+    return false;
   }
 }
 
-/**
- * Cancel delay detection job when session resolves.
- * @param {string} sessionId
- */
 async function cancelDelayDetection(sessionId) {
   try {
-    const jobs = await delayQueue.getRepeatableJobs();
-    const job = jobs.find(j => j.name === `delay:${sessionId}`);
-    if (job) {
-      await delayQueue.removeRepeatableByKey(job.key);
-      logger.info(`Delay detection cancelled: session ${sessionId}`);
-    }
+    await delayQueue.removeJobScheduler(schedulerIdFor(sessionId));
+    await redis.del(
+      `session:${sessionId}:last_movement_at`,
+      `session:${sessionId}:fallback_stage`,
+      `session:${sessionId}:fallback_stage_at`
+    );
+    logger.info(`Delay detection cancelled for ${sessionId}`);
+    return true;
   } catch (err) {
-    logger.error(`Failed to cancel delay detection: ${sessionId}`, err.message);
+    logger.error(`Failed to cancel delay detection: ${sessionId} | ${err.message}`);
+    return false;
   }
 }
 
-// Worker — processes each job
 const worker = new Worker(
   'delay-detection',
   async (job) => {
     const { sessionId, initialEtaMinutes } = job.data;
-    logger.debug(`Delay check running: session ${sessionId}`);
+    const session = await EmergencySession.findById(sessionId).lean();
 
-    try {
-      // Load session
-      const session = await EmergencySession.findById(sessionId).lean();
+    if (!session || ['RESOLVED', 'CANCELLED'].includes(session?.status)) {
+      await cancelDelayDetection(sessionId);
+      return;
+    }
+    if (!session.ambulanceId || !['ASSIGNED', 'EN_ROUTE', 'DELAYED'].includes(session.status)) return;
 
-      if (!session) {
-        logger.warn(`Delay check: session ${sessionId} not found — cancelling`);
-        await cancelDelayDetection(sessionId);
-        return;
+    const [etaRaw, lastMovementRaw] = await Promise.all([
+      redis.get(`session:${sessionId}:eta`),
+      redis.get(`session:${sessionId}:last_movement_at`),
+    ]);
+
+    let currentEta = Number(initialEtaMinutes) || 5;
+    if (etaRaw) {
+      try {
+        const parsed = JSON.parse(etaRaw);
+        if (Number(parsed.etaMinutes) > 0) currentEta = Number(parsed.etaMinutes);
+      } catch {
+        // Keep scheduler baseline if the cached ETA is malformed.
       }
+    }
 
-      // Skip if resolved or cancelled
-      if (['RESOLVED', 'CANCELLED'].includes(session.status)) {
-        logger.debug(`Delay check: session ${sessionId} is ${session.status} — cancelling`);
-        await cancelDelayDetection(sessionId);
-        return;
-      }
+    const drift = currentEta - Number(initialEtaMinutes || 0);
+    const stalledSeconds = lastMovementRaw ? Math.floor((Date.now() - Number(lastMovementRaw)) / 1000) : 0;
+    const stallThreshold = getStallThresholdSeconds();
 
-      // Skip if no ambulance
-      if (!session.ambulanceId) {
-        logger.debug(`Delay check: no ambulance for session ${sessionId}`);
-        return;
-      }
+    const delayedByEta = drift > 3;
+    // A DELAYED trip must keep being evaluated so reroute can later escalate to swap.
+    const delayedByStall = ['EN_ROUTE', 'DELAYED'].includes(session.status) && stalledSeconds >= stallThreshold;
 
-      // Get current ETA from Redis
-      const etaRaw = await redis.get(`session:${sessionId}:eta`);
-      if (!etaRaw) {
-        logger.debug(`Delay check: no ETA in Redis for session ${sessionId}`);
-        return;
-      }
+    logger.debug(
+      `Delay check session=${sessionId} status=${session.status} eta=${currentEta} drift=${drift.toFixed(1)} stalled=${stalledSeconds}s`
+    );
 
-      const { etaMinutes: currentEta } = JSON.parse(etaRaw);
-      const drift = currentEta - initialEtaMinutes;
-
-      logger.debug(
-        `Delay check: session ${sessionId} | initial=${initialEtaMinutes}min | current=${currentEta}min | drift=${drift}min`
-      );
-
-      if (drift > 3) {
-        await handleDelay(sessionId, drift, initialEtaMinutes, currentEta);
-      }
-    } catch (err) {
-      logger.error(`Delay detection error: session ${sessionId}`, err.message);
-      throw err; // BullMQ retries on throw
+    if (delayedByEta || delayedByStall) {
+      await handleDelay(sessionId, {
+        drift,
+        initialEtaMinutes,
+        currentEta,
+        stalledSeconds,
+        reason: delayedByStall ? 'AMBULANCE_STALLED' : 'ETA_DRIFT',
+      });
     }
   },
-  {
-    connection,
-    concurrency: 5,
-  }
+  { connection, concurrency: 5 }
 );
 
-worker.on('failed', (job, err) => {
-  logger.error(`Delay worker job failed: ${job?.id}`, err.message);
-});
+worker.on('failed', (job, err) => logger.error(`Delay worker job failed: ${job?.id} | ${err.message}`));
+worker.on('error', (err) => logger.error(`Delay worker error: ${err.message}`));
 
-worker.on('error', (err) => {
-  logger.error(`Delay worker error: ${err.message}`);
-});
-
-// Handle delay logic
-async function handleDelay(sessionId, drift, initialEtaMinutes, currentEta) {
-  logger.warn(`Delay detected: session ${sessionId} drifted ${drift}min`);
-
+async function handleDelay(sessionId, data) {
   const session = await EmergencySession.findById(sessionId);
-  if (!session) return;
+  if (!session || !['EN_ROUTE', 'DELAYED'].includes(session.status)) return;
 
-  if (session.status !== 'EN_ROUTE') {
-    logger.debug(`Delay handler: session ${sessionId} is ${session.status} — skipping`);
-    return;
+  const becameDelayed = session.status !== 'DELAYED';
+
+  if (becameDelayed) {
+    session.status = 'DELAYED';
+    session.addEvent('DELAYED', {
+      drift: data.drift,
+      initialEta: data.initialEtaMinutes,
+      currentEta: data.currentEta,
+      stalledSeconds: data.stalledSeconds,
+      reason: data.reason,
+      detectedAt: new Date().toISOString(),
+    });
+    await session.save();
   }
 
-  session.status = 'DELAYED';
-  session.addEvent('DELAYED', {
-    drift,
-    initialEta: initialEtaMinutes,
-    currentEta,
-    detectedAt: new Date().toISOString(),
-  });
-  await session.save();
-
-  logger.info(`Session ${sessionId} → DELAYED`);
-
-  // Emit to session room
   try {
     const { getIO } = require('../sockets/emergencyRoom');
-    getIO().to(`session:${sessionId}`).emit('delay_detected', {
-      sessionId,
-      drift,
-      currentEta,
-      message: 'Ambulance is delayed. Evaluating alternatives.',
-    });
-  } catch (e) {
-    logger.warn('Delay handler: socket emit failed', e.message);
+    const room = getIO().to(`session:${sessionId}`);
+
+    if (becameDelayed) {
+      room.emit('session_status_changed', {
+        sessionId,
+        oldStatus: 'EN_ROUTE',
+        newStatus: 'DELAYED',
+      });
+      room.emit('delay_detected', {
+        sessionId,
+        drift: data.drift,
+        currentEta: data.currentEta,
+        stalledSeconds: data.stalledSeconds,
+        reason: data.reason,
+        message: data.reason === 'AMBULANCE_STALLED'
+          ? 'Ambulance movement has stopped. Evaluating reroute or replacement.'
+          : 'Ambulance ETA has increased. Evaluating alternatives.',
+      });
+    }
+  } catch (err) {
+    logger.warn(`Delay socket emit failed: ${err.message}`);
   }
 
-  // Trigger fallback chain
-  try {
-    const { triggerFallback } = require('../services/fallbackService');
-    await triggerFallback(sessionId, currentEta);
-  } catch (e) {
-    logger.error('Delay handler: fallback failed', e.message);
-  }
+  const { triggerFallback } = require('../services/fallbackService');
+  await triggerFallback(
+    sessionId,
+    Number(data.currentEta) || Number(data.initialEtaMinutes) || 5,
+    { reason: data.reason, stalledSeconds: data.stalledSeconds }
+  );
 }
 
 logger.info('Delay detection worker initialized');

@@ -6,41 +6,39 @@ const ambulanceSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.ObjectId,
       ref: 'User',
       required: [true, 'Driver ID is required'],
-      unique: true
+      unique: true,
     },
     currentLocation: {
       lat: { type: Number, required: true },
-      lng: { type: Number, required: true }
+      lng: { type: Number, required: true },
     },
     status: {
       type: String,
-      enum: ['AVAILABLE', 'ASSIGNED', 'EN_ROUTE', 'BUSY'],
-      default: 'AVAILABLE'
+      enum: ['AVAILABLE', 'BUSY', 'OFFLINE'],
+      default: 'AVAILABLE',
     },
     lastPing: {
       type: Date,
-      default: Date.now
+      default: Date.now,
     },
     assignedSessionId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'EmergencySession',
-      default: null
+      default: null,
     },
     serviceArea: {
       type: {
         type: String,
         enum: ['Polygon'],
-        required: true
+        required: true,
       },
       coordinates: {
         type: [[[Number]]],
-        required: true
-      }
-    }
+        required: true,
+      },
+    },
   },
-  {
-    timestamps: true
-  }
+  { timestamps: true }
 );
 
 ambulanceSchema.index({ 'currentLocation.lat': 1, 'currentLocation.lng': 1 });

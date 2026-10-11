@@ -1,10 +1,11 @@
+const axios = require('axios');
 const EmergencySession = require('../models/EmergencySession');
+const Ambulance = require('../models/Ambulance');
 const { getSingleETA } = require('./mapsService');
 const { getAvailableAmbulancesNear } = require('./ambulanceCache');
 const redis = require('../config/redis');
 const logger = require('../utils/logger');
 
-// ── Helper: emit to session room safely ──────────────────────────────────────
 function emitToRoom(room, event, data) {
   try {
     const { getIO } = require('../sockets/emergencyRoom');
@@ -14,212 +15,369 @@ function emitToRoom(room, event, data) {
   }
 }
 
-/**
- * Main fallback orchestrator — runs levels 1-4 sequentially.
- * Short-circuits on first success at L1/L2.
- * L3 and L4 always run together if L1+L2 fail.
- * @param {string} sessionId
- * @param {number} currentEta - in minutes
- */
-async function triggerFallback(sessionId, currentEta) {
-  logger.info(`Fallback triggered: session ${sessionId} | currentEta: ${currentEta}min`);
-
-  const session = await EmergencySession.findById(sessionId).lean();
-  if (!session) {
-    logger.warn(`Fallback: session ${sessionId} not found`);
-    return;
-  }
-
-  // Level 1 — Reroute
-  const l1 = await fallbackLevel1(session, currentEta);
-  if (l1.improved) {
-    logger.info(`Fallback L1 success: session ${sessionId} → new ETA ${l1.newEta}min`);
-    return;
-  }
-
-  // Level 2 — Swap ambulance
-  const l2 = await fallbackLevel2(session, currentEta);
-  if (l2.improved) {
-    logger.info(`Fallback L2 success: session ${sessionId} → swapped to ${l2.newAmbulanceId}`);
-    return;
-  }
-
-  // Level 3 + 4 — AI message + hospital webhook
-  logger.warn(`Fallback L1+L2 failed: session ${sessionId} — escalating to L3+L4`);
-  await fallbackLevel3and4(session, currentEta);
+function mapsLink(fromLat, fromLng, toLat, toLng) {
+  return `https://www.google.com/maps/dir/?api=1&origin=${fromLat},${fromLng}&destination=${toLat},${toLng}&travelmode=driving`;
 }
 
-// ── Level 1: Reroute ─────────────────────────────────────────────────────────
-async function fallbackLevel1(session, currentEta) {
-  try {
-    // Get current driver location from Redis
-    const locRaw = await redis.get(`ambulance:${session.ambulanceId}:location`);
-    if (!locRaw) {
-      logger.debug('Fallback L1: no driver location in Redis — skipping');
-      return { improved: false };
+function getEscalationGraceSeconds() {
+  if (process.env.FALLBACK_ESCALATION_SECONDS) return Number(process.env.FALLBACK_ESCALATION_SECONDS);
+  return process.env.DEMO_MODE === 'true' ? 30 : 120;
+}
+
+function getLateReplacementRetrySeconds() {
+  if (process.env.FALLBACK_RETRY_SECONDS) return Number(process.env.FALLBACK_RETRY_SECONDS);
+  return process.env.DEMO_MODE === 'true' ? 30 : 60;
+}
+
+function stageKey(sessionId) {
+  return `session:${sessionId}:fallback_stage`;
+}
+
+function stageAtKey(sessionId) {
+  return `session:${sessionId}:fallback_stage_at`;
+}
+
+async function setFallbackStage(sessionId, stage) {
+  const pipeline = redis.pipeline();
+  pipeline.set(stageKey(sessionId), stage, 'EX', 7200);
+  pipeline.set(stageAtKey(sessionId), Date.now().toString(), 'EX', 7200);
+  await pipeline.exec();
+}
+
+async function clearFallbackStage(sessionId) {
+  await redis.del(stageKey(sessionId), stageAtKey(sessionId));
+}
+
+async function triggerFallback(sessionId, currentEta, context = {}) {
+  const session = await EmergencySession.findById(sessionId).lean();
+  if (!session || ['RESOLVED', 'CANCELLED'].includes(session.status)) return null;
+
+  const stage = await redis.get(stageKey(sessionId));
+  const reason = context.reason || [...(session.eventLog || [])]
+    .reverse()
+    .find((event) => event.status === 'DELAYED')?.meta?.reason || 'ETA_DRIFT';
+  const stalled = reason === 'AMBULANCE_STALLED';
+
+  // Stage 1 always gives the current driver a reroute opportunity first.
+  if (!stage) {
+    const l1 = await fallbackLevel1(session, currentEta);
+    if (l1.improved) {
+      await clearFallbackStage(sessionId);
+      return { stage: 'REROUTED', ...l1 };
     }
 
-    const { latitude: dLat, longitude: dLng } = JSON.parse(locRaw);
+    await setFallbackStage(sessionId, 'REROUTE_SUGGESTED');
+    logger.info(`Fallback stage REROUTE_SUGGESTED session=${sessionId}`);
+    return { stage: 'REROUTE_SUGGESTED', improved: false };
+  }
 
-    // Patient location — stored as { lat, lng } in schema
+  if (stage === 'REROUTE_SUGGESTED') {
+    const stageAt = Number(await redis.get(stageAtKey(sessionId))) || Date.now();
+    const ageSeconds = Math.floor((Date.now() - stageAt) / 1000);
+    const graceSeconds = getEscalationGraceSeconds();
+
+    if (ageSeconds < graceSeconds) {
+      logger.debug(`Fallback waiting after reroute session=${sessionId} ${ageSeconds}/${graceSeconds}s`);
+      return { stage, waiting: true, ageSeconds, graceSeconds };
+    }
+
+    const l2 = await fallbackLevel2(session, currentEta, { stalled });
+    if (l2.improved) {
+      await setFallbackStage(sessionId, 'AMBULANCE_SWAPPED');
+      return { stage: 'AMBULANCE_SWAPPED', ...l2 };
+    }
+
+    await fallbackLevel3and4(session, currentEta);
+    await setFallbackStage(sessionId, 'AI_AND_HOSPITAL_ESCALATED');
+    logger.info(`Fallback stage AI_AND_HOSPITAL_ESCALATED session=${sessionId}`);
+    return { stage: 'AI_AND_HOSPITAL_ESCALATED', improved: false };
+  }
+
+  // AI/hospital escalation is not the end of the dispatch search. A replacement
+  // driver can come online later, so periodically retry L2 without repeating AI/webhook.
+  if (stage === 'AI_AND_HOSPITAL_ESCALATED') {
+    const stageAt = Number(await redis.get(stageAtKey(sessionId))) || Date.now();
+    const ageSeconds = Math.floor((Date.now() - stageAt) / 1000);
+    const retrySeconds = getLateReplacementRetrySeconds();
+
+    if (ageSeconds < retrySeconds) {
+      return { stage, waitingForReplacement: true, ageSeconds, retrySeconds };
+    }
+
+    const l2 = await fallbackLevel2(session, currentEta, { stalled });
+    if (l2.improved) {
+      await setFallbackStage(sessionId, 'AMBULANCE_SWAPPED');
+      logger.info(`Late replacement found after escalation session=${sessionId}`);
+      return { stage: 'AMBULANCE_SWAPPED', ...l2 };
+    }
+
+    await setFallbackStage(sessionId, 'AI_AND_HOSPITAL_ESCALATED');
+    logger.debug(`No late replacement yet session=${sessionId}; retrying in ${retrySeconds}s`);
+    return { stage, waitingForReplacement: true, retrySeconds };
+  }
+
+  return { stage, repeated: true };
+}
+
+async function fallbackLevel1(session, currentEta) {
+  try {
+    const locRaw = await redis.get(`ambulance:${session.ambulanceId}:location`);
+    if (!locRaw) return { improved: false };
+
+    const loc = JSON.parse(locRaw);
+    const dLat = loc.lat ?? loc.latitude;
+    const dLng = loc.lng ?? loc.longitude;
     const pLat = session.location.lat;
     const pLng = session.location.lng;
-
-    // Fresh ETA with live traffic
     const freshEta = await getSingleETA(dLat, dLng, pLat, pLng);
+    const navigationUrl = mapsLink(dLat, dLng, pLat, pLng);
 
-    // Only counts as improvement if > 1 minute better
+    const ambulance = await Ambulance.findById(session.ambulanceId).lean();
+    const payload = {
+      sessionId: session._id,
+      currentEta,
+      freshEta,
+      navigationUrl,
+      message: 'Delay detected. Re-open navigation for the latest traffic-aware route.',
+    };
+
+    if (ambulance?.driverId) {
+      emitToRoom(`driver:${ambulance.driverId}`, 'reroute_suggested', payload);
+    }
+    emitToRoom(`session:${session._id}`, 'reroute_suggested', payload);
+
+    const liveSession = await EmergencySession.findById(session._id);
+    liveSession.addEvent('REROUTE_SUGGESTED', { previousEta: currentEta, freshEta, navigationUrl });
+
     if (freshEta < currentEta - 1) {
-      // Update Redis ETA key
       await redis.set(
         `session:${session._id}:eta`,
         JSON.stringify({ etaMinutes: freshEta, calculatedAt: new Date().toISOString() }),
         'EX', 90
       );
-
-      // Write to eventLog
-      const liveSession = await EmergencySession.findById(session._id);
-      liveSession.addEvent('REROUTED', {
-        previousEta: currentEta,
-        newEta: freshEta,
-      });
+      liveSession.status = 'EN_ROUTE';
+      liveSession.addEvent('REROUTED', { previousEta: currentEta, newEta: freshEta });
       await liveSession.save();
 
-      // Emit to session room
+      emitToRoom(`session:${session._id}`, 'session_status_changed', {
+        sessionId: session._id,
+        oldStatus: 'DELAYED',
+        newStatus: 'EN_ROUTE',
+      });
       emitToRoom(`session:${session._id}`, 'route_updated', {
         sessionId: session._id,
         newEta: freshEta,
-        message: 'Your ambulance has been rerouted for a faster arrival.',
+        navigationUrl,
+        message: 'A faster route is available for the current ambulance.',
       });
-
       return { improved: true, newEta: freshEta };
     }
 
-    logger.debug(`Fallback L1: no improvement (fresh=${freshEta}min vs current=${currentEta}min)`);
-    return { improved: false };
+    await liveSession.save();
+    return { improved: false, freshEta, navigationUrl };
   } catch (err) {
-    logger.error('Fallback L1 error', err.message);
+    logger.error(`Fallback L1 error: ${err.message}`);
     return { improved: false };
   }
 }
 
-// ── Level 2: Swap Ambulance ──────────────────────────────────────────────────
-async function fallbackLevel2(session, currentEta) {
+async function reserveReplacement(ambulanceId) {
+  const id = ambulanceId.toString();
+  const lua = `
+    local status = redis.call('GET', KEYS[1])
+    if status ~= 'AVAILABLE' then return 0 end
+    if redis.call('SISMEMBER', KEYS[2], ARGV[1]) == 0 then return 0 end
+    if redis.call('SISMEMBER', KEYS[3], ARGV[1]) == 0 then return 0 end
+    redis.call('SET', KEYS[1], 'BUSY')
+    redis.call('SREM', KEYS[2], ARGV[1])
+    return 1
+  `;
+  return (await redis.eval(
+    lua,
+    3,
+    `ambulance:${id}:status`,
+    'ambulance:available',
+    'ambulance:online',
+    id
+  )) === 1;
+}
+
+async function releaseReplacement(ambulanceId) {
+  const id = ambulanceId.toString();
+  const pipeline = redis.pipeline();
+  pipeline.set(`ambulance:${id}:status`, 'AVAILABLE');
+  pipeline.sadd('ambulance:available', id);
+  await pipeline.exec();
+}
+
+async function fallbackLevel2(session, currentEta, { stalled = false } = {}) {
   try {
     const pLat = session.location.lat;
     const pLng = session.location.lng;
-
-    // Find available ambulances near patient
     const candidates = await getAvailableAmbulancesNear(pLat, pLng);
+    const alternatives = candidates.filter((a) => a.ambulanceId.toString() !== session.ambulanceId.toString());
 
-    // Exclude currently assigned ambulance
-    const alternatives = candidates.filter(
-      a => (a.ambulanceId || a._id).toString() !== session.ambulanceId.toString()
-    );
-
-    if (alternatives.length === 0) {
-      logger.debug('Fallback L2: no alternative ambulances available');
+    if (!alternatives.length) {
+      logger.info(`Fallback L2: no replacement ambulances online for session=${session._id}`);
       return { improved: false };
     }
 
-    // Get ETAs for all alternatives in parallel
-    const etaResults = await Promise.all(
-      alternatives.map(async (amb) => {
-        const ambId = amb.ambulanceId || amb._id;
-        const locRaw = await redis.get(`ambulance:${ambId}:location`);
-        if (!locRaw) return null;
-        const { latitude, longitude } = JSON.parse(locRaw);
-        const eta = await getSingleETA(latitude, longitude, pLat, pLng);
-        return { ambulanceId: ambId, eta };
-      })
-    );
+    const etaResults = (await Promise.all(alternatives.map(async (amb) => {
+      const raw = await redis.get(`ambulance:${amb.ambulanceId}:location`);
+      if (!raw) return null;
+      const loc = JSON.parse(raw);
+      const lat = loc.lat ?? loc.latitude;
+      const lng = loc.lng ?? loc.longitude;
+      const eta = await getSingleETA(lat, lng, pLat, pLng);
+      return { ambulanceId: amb.ambulanceId, eta };
+    }))).filter(Boolean).sort((a, b) => a.eta - b.eta);
 
-    const valid = etaResults.filter(Boolean);
-    if (valid.length === 0) {
-      logger.debug('Fallback L2: no ambulance location data available');
-      return { improved: false };
-    }
+    for (const candidate of etaResults) {
+      // ETA drift requires a genuinely faster vehicle. A confirmed stalled vehicle is
+      // unreliable, so a similarly-close replacement is still useful.
+      const qualifies = stalled
+        ? candidate.eta <= Math.max(Number(currentEta) + 1, 2)
+        : candidate.eta < Number(currentEta) - 2;
 
-    // Find best alternative
-    const best = valid.reduce((a, b) => (a.eta < b.eta ? a : b));
+      if (!qualifies) continue;
+      if (!(await reserveReplacement(candidate.ambulanceId))) continue;
 
-    // Only swap if improvement > 2 minutes
-    if (best.eta < currentEta - 2) {
       const liveSession = await EmergencySession.findById(session._id);
+      if (!liveSession || ['RESOLVED', 'CANCELLED'].includes(liveSession.status)) {
+        await releaseReplacement(candidate.ambulanceId);
+        return { improved: false };
+      }
 
       const previousAmbulanceId = liveSession.ambulanceId;
-      liveSession.ambulanceId = best.ambulanceId;
+      const [oldAmbulance, newAmbulance] = await Promise.all([
+        Ambulance.findById(previousAmbulanceId),
+        Ambulance.findById(candidate.ambulanceId),
+      ]);
+
+      if (!newAmbulance) {
+        await releaseReplacement(candidate.ambulanceId);
+        continue;
+      }
+
+      liveSession.ambulanceId = candidate.ambulanceId;
       liveSession.status = 'ASSIGNED';
       liveSession.addEvent('AMBULANCE_SWAPPED', {
         previousAmbulanceId,
-        newAmbulanceId: best.ambulanceId,
+        newAmbulanceId: candidate.ambulanceId,
         previousEta: currentEta,
-        newEta: best.eta,
+        newEta: candidate.eta,
+        reason: stalled ? 'CURRENT_AMBULANCE_STALLED' : 'FASTER_REPLACEMENT',
       });
-      await liveSession.save();
 
-      // Update Redis — old ambulance back to AVAILABLE, new one BUSY
-      await redis.set(`ambulance:${previousAmbulanceId}:status`, 'AVAILABLE');
-      await redis.sadd('ambulance:available', previousAmbulanceId.toString());
-      await redis.set(`ambulance:${best.ambulanceId}:status`, 'BUSY');
-      await redis.srem('ambulance:available', best.ambulanceId.toString());
+      if (oldAmbulance) {
+        // A confirmed stalled vehicle should not immediately be dispatched again.
+        oldAmbulance.status = stalled ? 'OFFLINE' : 'AVAILABLE';
+        oldAmbulance.assignedSessionId = null;
+      }
+      newAmbulance.status = 'BUSY';
+      newAmbulance.assignedSessionId = session._id;
 
-      // Emit to session room
+      const pipeline = redis.pipeline();
+      pipeline.set(`ambulance:${previousAmbulanceId}:status`, stalled ? 'OFFLINE' : 'AVAILABLE');
+      if (stalled) {
+        pipeline.srem('ambulance:available', previousAmbulanceId.toString());
+        pipeline.srem('ambulance:online', previousAmbulanceId.toString());
+      } else {
+        pipeline.sadd('ambulance:available', previousAmbulanceId.toString());
+      }
+      pipeline.set(
+        `session:${session._id}:eta`,
+        JSON.stringify({ etaMinutes: candidate.eta, calculatedAt: new Date().toISOString() }),
+        'EX', 90
+      );
+      pipeline.set(`session:${session._id}:last_movement_at`, Date.now().toString(), 'EX', 7200);
+
+      await Promise.all([
+        liveSession.save(),
+        oldAmbulance ? oldAmbulance.save() : Promise.resolve(),
+        newAmbulance.save(),
+        pipeline.exec(),
+      ]);
+
+      const { scheduleDelayDetection } = require('../workers/delayDetection.worker');
+      await scheduleDelayDetection(session._id, Math.max(1, candidate.eta));
+
+      emitToRoom(`session:${session._id}`, 'session_status_changed', {
+        sessionId: session._id,
+        oldStatus: 'DELAYED',
+        newStatus: 'ASSIGNED',
+      });
       emitToRoom(`session:${session._id}`, 'ambulance_swapped', {
         sessionId: session._id,
-        newAmbulanceId: best.ambulanceId,
-        newEta: best.eta,
-        message: 'A closer ambulance has been assigned to you.',
+        previousAmbulanceId,
+        newAmbulanceId: candidate.ambulanceId,
+        newEta: candidate.eta,
+        message: 'The delayed ambulance was replaced with another available ambulance.',
+      });
+      // Reuse the normal patient assignment event so existing tracking UI updates
+      // ambulance id and ETA immediately after a swap.
+      emitToRoom(`session:${session._id}`, 'ambulance_assigned', {
+        sessionId: session._id,
+        ambulanceId: candidate.ambulanceId,
+        etaMinutes: candidate.eta,
+        etaSeconds: candidate.eta * 60,
+        swapped: true,
       });
 
-      return { improved: true, newAmbulanceId: best.ambulanceId };
+      if (oldAmbulance?.driverId) {
+        emitToRoom(`driver:${oldAmbulance.driverId}`, 'assignment_cancelled', {
+          sessionId: session._id,
+          reason: stalled
+            ? 'Your ambulance was taken offline after a movement stall.'
+            : 'A closer ambulance was available.',
+          takenOffline: stalled,
+        });
+      }
+      if (newAmbulance.driverId) {
+        emitToRoom(`driver:${newAmbulance.driverId}`, 'driver_assignment', {
+          sessionId: session._id,
+          emergencyType: session.emergencyType,
+          severityLevel: session.severityLevel,
+          patientLocation: session.location,
+          description: session.description,
+          etaMinutes: candidate.eta,
+          swapped: true,
+        });
+      }
+
+      logger.info(`Fallback L2 swapped session=${session._id} old=${previousAmbulanceId} new=${candidate.ambulanceId} eta=${candidate.eta}`);
+      return { improved: true, newAmbulanceId: candidate.ambulanceId, newEta: candidate.eta };
     }
 
-    logger.debug(
-      `Fallback L2: best alternative ${best.eta}min not better enough vs current ${currentEta}min`
-    );
+    logger.info(`Fallback L2: no replacement met policy for session=${session._id}`);
     return { improved: false };
   } catch (err) {
-    logger.error('Fallback L2 error', err.message);
+    logger.error(`Fallback L2 error: ${err.message}`);
     return { improved: false };
   }
 }
 
-// ── Level 3 + 4: AI message + Hospital webhook ────────────────────────────────
 async function fallbackLevel3and4(session, currentEta) {
-  // ── Level 3: AI delay message ─────────────────────────────────────────────
   try {
     const { generateDelayMessage } = require('./ai/delayMessageService');
-
-    // Get drift from eventLog
-    const delayEvent = [...session.eventLog]
-      .reverse()
-      .find(e => e.status === 'DELAYED');
+    const delayEvent = [...(session.eventLog || [])].reverse().find((e) => e.status === 'DELAYED');
     const drift = delayEvent?.meta?.drift || 0;
-
     const aiMessage = await generateDelayMessage(session, currentEta, drift);
 
     emitToRoom(`session:${session._id}`, 'ai_suggestion', {
       sessionId: session._id,
       patientMessage: aiMessage.patientMessage,
       firstAidAction: aiMessage.firstAidAction,
+      message: aiMessage.patientMessage,
     });
 
     const liveSession = await EmergencySession.findById(session._id);
-    liveSession.addEvent('AI_SUGGESTION_SENT', {
-      patientMessage: aiMessage.patientMessage,
-      firstAidAction: aiMessage.firstAidAction,
-    });
+    liveSession.addEvent('AI_SUGGESTION_SENT', aiMessage);
     await liveSession.save();
-
-    logger.info(`Fallback L3 complete: session ${session._id}`);
   } catch (err) {
-    logger.error('Fallback L3 error', err.message);
-    // L3 failure does not stop L4
+    logger.error(`Fallback L3 error: ${err.message}`);
   }
 
-  // ── Level 4: Hospital webhook ─────────────────────────────────────────────
-  // Always runs regardless of L3 success — serves different purpose
   try {
     const payload = {
       sessionId: session._id,
@@ -231,16 +389,19 @@ async function fallbackLevel3and4(session, currentEta) {
       timestamp: new Date().toISOString(),
     };
 
-    logger.warn(`Fallback L4: hospital webhook triggered`, payload);
+    if (process.env.HOSPITAL_WEBHOOK_URL) {
+      await axios.post(process.env.HOSPITAL_WEBHOOK_URL, payload, { timeout: 5000 });
+    }
 
     const liveSession = await EmergencySession.findById(session._id);
-    liveSession.addEvent('HOSPITAL_WEBHOOK_TRIGGERED', { payload });
+    liveSession.addEvent('HOSPITAL_WEBHOOK_TRIGGERED', {
+      delivered: Boolean(process.env.HOSPITAL_WEBHOOK_URL),
+      payload,
+    });
     await liveSession.save();
-
-    logger.info(`Fallback L4 complete: session ${session._id}`);
   } catch (err) {
-    logger.error('Fallback L4 error', err.message);
+    logger.error(`Fallback L4 error: ${err.message}`);
   }
 }
 
-module.exports = { triggerFallback };
+module.exports = { triggerFallback, clearFallbackStage };

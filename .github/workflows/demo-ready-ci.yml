@@ -1,0 +1,66 @@
+name: Demo-ready CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [fix/demo-ready-e2e]
+
+jobs:
+  frontend-build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npm run build
+
+  backend-test:
+    runs-on: ubuntu-latest
+    services:
+      mongo:
+        image: mongo:7
+        ports:
+          - 27017:27017
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+    env:
+      NODE_ENV: test
+      MONGO_URI: mongodb://127.0.0.1:27017/rapidaid_test
+      REDIS_URL: redis://127.0.0.1:6379
+      JWT_SECRET: ci_access_secret_please_replace
+      JWT_REFRESH_SECRET: ci_refresh_secret_please_replace
+      JWT_EXPIRES_IN: 15m
+      JWT_REFRESH_EXPIRES_IN: 7d
+      CLIENT_URL: http://localhost:5173
+      DEMO_MODE: true
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+      - run: npm ci
+      - name: Syntax check changed runtime files
+        run: |
+          node --check src/services/ambulanceCache.js
+          node --check src/services/assignmentService.js
+          node --check src/services/fallbackService.js
+          node --check src/services/mapsService.js
+          node --check src/sockets/emergencyRoom.js
+          node --check src/workers/delayDetection.worker.js
+          node --check src/controllers/ambulanceController.js
+      - run: npm test
