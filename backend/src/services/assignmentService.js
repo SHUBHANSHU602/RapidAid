@@ -75,34 +75,35 @@ function scoreCandidate(etaSeconds, distanceKm, lastPingMs) {
   return etaScore * 0.5 + distScore * 0.3 + pingScore * 0.2;
 }
 
-async function reserveAmbulance(ambulanceId) {
-  const id = ambulanceId.toString();
+// Reservation token prevents stale/failed jobs from freeing somebody else's claim.
+async function reserveAmbulance(ambulanceId, sessionId) {
+  const id = String(ambulanceId);
   const lua = `
-    local status = redis.call('GET', KEYS[1])
-    if status ~= 'AVAILABLE' then return 0 end
+    if redis.call('GET', KEYS[1]) ~= 'AVAILABLE' then return 0 end
     if redis.call('SISMEMBER', KEYS[2], ARGV[1]) == 0 then return 0 end
     if redis.call('SISMEMBER', KEYS[3], ARGV[1]) == 0 then return 0 end
+    if redis.call('EXISTS', KEYS[4]) == 1 then return 0 end
     redis.call('SET', KEYS[1], 'BUSY')
+    redis.call('SET', KEYS[4], ARGV[2])
     redis.call('SREM', KEYS[2], ARGV[1])
     return 1
   `;
-  const result = await redis.eval(
-    lua,
-    3,
-    `ambulance:${id}:status`,
-    AVAILABLE_SET_KEY,
-    'ambulance:online',
-    id
-  );
-  return result === 1;
+  return (await redis.eval(lua, 4,
+    `ambulance:${id}:status`, AVAILABLE_SET_KEY, 'ambulance:online',
+    `ambulance:${id}:reservation`, id, String(sessionId))) === 1;
 }
 
-async function releaseReservation(ambulanceId) {
-  const id = ambulanceId.toString();
-  const pipeline = redis.pipeline();
-  pipeline.set(`ambulance:${id}:status`, 'AVAILABLE');
-  pipeline.sadd(AVAILABLE_SET_KEY, id);
-  await pipeline.exec();
+async function releaseReservation(ambulanceId, sessionId) {
+  const id = String(ambulanceId);
+  const lua = `
+    if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end
+    redis.call('DEL', KEYS[1])
+    redis.call('SET', KEYS[2], 'AVAILABLE')
+    redis.call('SADD', KEYS[3], ARGV[2])
+    return 1
+  `;
+  return redis.eval(lua, 3, `ambulance:${id}:reservation`,
+    `ambulance:${id}:status`, AVAILABLE_SET_KEY, String(sessionId), id);
 }
 
 async function assignAmbulance(sessionId, patientLat, patientLng) {
@@ -136,7 +137,7 @@ async function assignAmbulance(sessionId, patientLat, patientLng) {
 
   let best = null;
   for (const candidate of scored) {
-    if (await reserveAmbulance(candidate.ambulanceId)) {
+    if (await reserveAmbulance(candidate.ambulanceId, sessionId)) {
       best = candidate;
       break;
     }
@@ -148,41 +149,42 @@ async function assignAmbulance(sessionId, patientLat, patientLng) {
   }
 
   try {
-    const session = await EmergencySession.findById(sessionId);
-    if (!session || ['RESOLVED', 'CANCELLED'].includes(session.status)) {
-      await releaseReservation(best.ambulanceId);
-      return null;
-    }
-
     const ambulanceDoc = docMap[best.ambulanceId] || await Ambulance.findById(best.ambulanceId).lean();
     const etaMinutes = Math.max(1, Math.ceil(best.etaSeconds / 60));
 
-    session.ambulanceId = best.ambulanceId;
-    if (session.status === 'INITIATED') session.status = 'ASSIGNED';
-    session.addEvent('ASSIGNED', {
-      ambulanceId: best.ambulanceId,
-      etaSeconds: best.etaSeconds,
-      distanceKm: best.distanceKm,
-      score: best.score,
-    });
+    // Compare-and-set the ambulance first. Only the winner may bind a session.
+    const claimed = await Ambulance.findOneAndUpdate(
+      { _id: best.ambulanceId, status: 'AVAILABLE', assignedSessionId: null },
+      { $set: { assignedSessionId: sessionId, status: 'BUSY' } },
+      { new: true }
+    );
+    if (!claimed) {
+      await releaseReservation(best.ambulanceId, sessionId);
+      return null;
+    }
 
-    await Promise.all([
-      session.save(),
-      Ambulance.findByIdAndUpdate(best.ambulanceId, {
-        assignedSessionId: sessionId,
-        status: 'BUSY',
-      }),
-      redis.set(
-        `session:${sessionId}:eta`,
-        JSON.stringify({
-          etaMinutes,
-          source: 'assignment',
-          calculatedAt: new Date().toISOString(),
-        }),
-        'EX',
-        300
-      ),
-    ]);
+    const session = await EmergencySession.findOneAndUpdate(
+      { _id: sessionId, status: 'INITIATED', ambulanceId: null },
+      {
+        $set: { ambulanceId: best.ambulanceId, status: 'ASSIGNED' },
+        $push: { eventLog: { status: 'ASSIGNED', timestamp: new Date(), meta: {
+          ambulanceId: best.ambulanceId, etaSeconds: best.etaSeconds,
+          distanceKm: best.distanceKm, score: best.score
+        } } }
+      },
+      { new: true }
+    );
+    if (!session) {
+      await Ambulance.updateOne(
+        { _id: best.ambulanceId, assignedSessionId: sessionId },
+        { $set: { assignedSessionId: null, status: 'AVAILABLE' } }
+      );
+      await releaseReservation(best.ambulanceId, sessionId);
+      return null;
+    }
+    await redis.set(`session:${sessionId}:eta`,
+      JSON.stringify({ etaMinutes, source: 'assignment', calculatedAt: new Date().toISOString() }), 'EX', 300);
+
 
     const io = getIO();
     const patientPayload = {
@@ -216,7 +218,9 @@ async function assignAmbulance(sessionId, patientLat, patientLng) {
       latency: Date.now() - startedAt,
     };
   } catch (err) {
-    await releaseReservation(best.ambulanceId).catch(() => {});
+    // Do not blindly release after a possible partial MongoDB commit.
+    // Reconciliation must inspect persistent assignment ownership first.
+    logger.error('assignment_requires_reconciliation', { sessionId: String(sessionId), ambulanceId: String(best.ambulanceId), error: err.message });
     throw err;
   }
 }

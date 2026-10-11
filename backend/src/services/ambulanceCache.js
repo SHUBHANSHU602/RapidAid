@@ -42,13 +42,23 @@ async function syncAmbulancesToRedis() {
 }
 
 async function updateAmbulanceStatus(ambulanceId, newStatus) {
-  const id = ambulanceId.toString();
-
-  await redis.set(`ambulance:${id}:status`, newStatus);
-  if (newStatus === 'AVAILABLE') await redis.sadd(AVAILABLE_SET_KEY, id);
-  else await redis.srem(AVAILABLE_SET_KEY, id);
-
+  const id = String(ambulanceId);
+  const reservationKey = `ambulance:${id}:reservation`;
+  if (newStatus === 'AVAILABLE') {
+    const active = await Ambulance.findOne({ _id: ambulanceId, assignedSessionId: { $ne: null } }).lean();
+    if (active) throw new Error('Ambulance has a durable assignment and cannot become AVAILABLE');
+  }
   await Ambulance.findByIdAndUpdate(ambulanceId, { status: newStatus });
+  const pipeline = redis.pipeline();
+  pipeline.set(`ambulance:${id}:status`, newStatus);
+  if (newStatus === 'AVAILABLE') {
+    pipeline.del(reservationKey);
+    pipeline.sadd(AVAILABLE_SET_KEY, id);
+  } else {
+    pipeline.srem(AVAILABLE_SET_KEY, id);
+    if (newStatus === 'OFFLINE') pipeline.del(reservationKey);
+  }
+  await pipeline.exec();
 }
 
 async function setAmbulanceOnline(ambulanceId, online) {
