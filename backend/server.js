@@ -10,6 +10,8 @@ const { initSocket } = require('./src/sockets/emergencyRoom');
 require('./src/workers/mapsQueue.worker');
 const { scheduleDelayDetection } = require('./src/workers/delayDetection.worker');
 const PORT = process.env.PORT || 5000;
+let httpServer;
+let stopping = false;
 
 function getRecoveryWindowHours() {
   if (process.env.ACTIVE_SESSION_RECOVERY_HOURS) {
@@ -76,7 +78,7 @@ const startServer = async () => {
     logger.warn(`Failed to sync ambulances to Redis: ${err.message}`);
   }
 
-  const httpServer = http.createServer(app);
+  httpServer = http.createServer(app);
   initSocket(httpServer);
 
   // Restore monitoring only for recent live-looking emergencies after a restart.
@@ -89,9 +91,33 @@ const startServer = async () => {
   });
 };
 
-process.on('unhandledRejection', (err) => {
-  logger.error(`Unhandled Rejection: ${err.message}`);
-  process.exit(1);
+async function shutdown(signal) {
+  if (stopping) return;
+  stopping = true;
+  logger.warn('server_shutdown_started', { signal });
+  const shutdownTimer = setTimeout(() => process.exit(1), 15000);
+  shutdownTimer.unref();
+  try {
+    if (httpServer) await new Promise((resolve, reject) =>
+      httpServer.close(error => error ? reject(error) : resolve())
+    );
+    await Promise.allSettled([
+      require('mongoose').disconnect(),
+      redis.quit()
+    ]);
+    clearTimeout(shutdownTimer);
+    logger.info('server_shutdown_complete');
+    process.exit(0);
+  } catch (error) {
+    logger.error('server_shutdown_failed', { error: error.message });
+    process.exit(1);
+  }
+}
+process.once('SIGTERM', () => shutdown('SIGTERM'));
+process.once('SIGINT', () => shutdown('SIGINT'));
+process.on('unhandledRejection', (error) => {
+  logger.error('unhandled_rejection', { error: error.message });
+  shutdown('unhandledRejection');
 });
 
 startServer();
