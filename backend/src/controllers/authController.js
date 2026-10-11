@@ -127,3 +127,11 @@ exports.logout = async (req, res, next) => {
     next(err);
   }
 };
+// Operational drivers are onboarded by an authenticated admin.
+exports.createDriver = async (req, res, next) => {
+  try {
+    const { name, email, password } = req.body;
+    const driver = await User.create({ name, email, password, role: 'DRIVER' });
+    return res.status(201).json({ success: true, user: { id: driver.id, name: driver.name, email: driver.email, role: driver.role } });
+  } catch (err) { next(err); }
+};
