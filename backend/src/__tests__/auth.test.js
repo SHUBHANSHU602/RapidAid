@@ -102,3 +102,13 @@ describe('Auth — Protected route', () => {
     expect(res.statusCode).toBe(401);
   });
 });
+
+describe('Privilege boundaries', () => {
+  test('public registration cannot create an admin or driver', async () => {
+    for (const role of ['ADMIN', 'DRIVER']) {
+      const result = await request(app).post('/api/v1/auth/register')
+        .send({ name: 'Blocked', email: 'testauthblocked@test.com', password: 'test123', role });
+      expect(result.status).toBe(403);
+    }
+  });
+});

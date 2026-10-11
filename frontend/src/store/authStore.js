@@ -17,8 +17,8 @@ const useAuthStore = create((set) => ({
     return decoded.role?.toUpperCase();
   },
 
-  register: async (name, email, password, role) => {
-    const res = await api.post('/auth/register', { name, email, password, role });
+  register: async (name, email, password) => {
+    const res = await api.post('/auth/register', { name, email, password });
     const { accessToken, refreshToken, user } = res.data;
     localStorage.setItem('accessToken', accessToken);
     localStorage.setItem('refreshToken', refreshToken);

@@ -15,7 +15,6 @@ export default function Register() {
     name: '',
     email: '',
     password: '',
-    role: 'USER',
   });
   const [loading, setLoading] = useState(false);
   const register = useAuthStore((s) => s.register);
@@ -25,7 +24,7 @@ export default function Register() {
     e.preventDefault();
     setLoading(true);
     try {
-      const role = await register(formData.name, formData.email, formData.password, formData.role);
+      const role = await register(formData.name, formData.email, formData.password);
       connectSocket();
       toast.success('Account created successfully!');
       navigate(roleRoutes[role] || '/dashboard');
@@ -110,35 +109,7 @@ export default function Register() {
               required
             />
 
-            <div className="space-y-2">
-              <label className="block text-sm font-medium text-text-muted">I am a...</label>
-              <div className="grid grid-cols-2 gap-3">
-                <button
-                  type="button"
-                  onClick={() => setFormData({ ...formData, role: 'USER' })}
-                  className={`
-                    p-3 rounded-xl border transition-all
-                    ${formData.role === 'USER' 
-                      ? 'bg-accent-red/20 border-accent-red text-text-primary' 
-                      : 'bg-bg-elevated border-border-light text-text-muted hover:bg-bg-elevated/80'}
-                  `}
-                >
-                  Patient
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setFormData({ ...formData, role: 'DRIVER' })}
-                  className={`
-                    p-3 rounded-xl border transition-all
-                    ${formData.role === 'DRIVER' 
-                      ? 'bg-accent-blue/20 border-accent-blue text-text-primary' 
-                      : 'bg-bg-elevated border-border-light text-text-muted hover:bg-bg-elevated/80'}
-                  `}
-                >
-                  Driver
-                </button>
-              </div>
-            </div>
+            <p className="text-xs text-text-muted">Patient registration is self-service; verified operators provision driver accounts.</p>
 
             <Button type="submit" fullWidth loading={loading} size="lg" className="mt-2">
               Create Account
