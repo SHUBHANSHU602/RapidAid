@@ -13,7 +13,7 @@ const logger = require('../../utils/logger');
  */
 async function selectHospital(patientLat, patientLng, triageResult, emergencyType) {
   // Fetch all active hospitals
-  const hospitals = await Hospital.find({ isActive: true }).lean();
+  const hospitals = await Hospital.find({ isActive: true, availableBeds: { $gt: 0 }, emergencyCapacity: { $gt: 0 } }).lean();
 
   if (hospitals.length === 0) {
     logger.warn('Hospital selection: no active hospitals found');
@@ -76,8 +76,21 @@ Respond ONLY with valid JSON, no markdown:
       return fallbackHospitalSelection(top5);
     }
 
-    logger.info(`Hospital selection: top pick is ${parsed.ranked[0]?.name}`);
-    return parsed.ranked;
+    // LLM output is untrusted: accept only the exact, currently eligible IDs.
+    const eligibleById = new Map(top5.map(h => [h.id, h]));
+    const used = new Set();
+    const validated = parsed.ranked
+      .filter(entry => entry && typeof entry.id === 'string' && eligibleById.has(entry.id))
+      .filter(entry => { if (used.has(entry.id)) return false; used.add(entry.id); return true; })
+      .slice(0, 3)
+      .map((entry, index) => ({
+        id: entry.id, name: eligibleById.get(entry.id).name,
+        reason: typeof entry.reason === 'string' ? entry.reason.slice(0, 250) : 'Eligible nearby hospital',
+        rank: index + 1
+      }));
+    if (!validated.length) return fallbackHospitalSelection(top5);
+    logger.info(`Hospital selection: top pick is ${validated[0].name}`);
+    return validated;
   } catch (err) {
     logger.error('Hospital selection: Groq failed — using distance fallback', err.message);
     return fallbackHospitalSelection(top5);
