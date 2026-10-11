@@ -9,6 +9,8 @@ const { syncAmbulancesToRedis } = require('./src/services/ambulanceCache');
 const { initSocket } = require('./src/sockets/emergencyRoom');
 require('./src/workers/mapsQueue.worker');
 const { scheduleDelayDetection } = require('./src/workers/delayDetection.worker');
+const { recoverPendingDispatches } = require('./src/services/dispatchQueue');
+const { startDispatchWorker } = require('./src/workers/dispatch.worker');
 const PORT = process.env.PORT || 5000;
 
 function getRecoveryWindowHours() {
@@ -82,6 +84,8 @@ const startServer = async () => {
   // Restore monitoring only for recent live-looking emergencies after a restart.
   // Old unfinished demo records remain in MongoDB but are not resurrected as live trips.
   await recoverActiveDelayMonitors();
+  startDispatchWorker();
+  await recoverPendingDispatches();
 
   httpServer.listen(PORT, () => {
     logger.info(`RapidAid server running on port ${PORT} in ${process.env.NODE_ENV} mode`);
