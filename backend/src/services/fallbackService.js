@@ -87,15 +87,15 @@ async function triggerFallback(sessionId, currentEta, context = {}) {
       return { stage: 'AMBULANCE_SWAPPED', ...l2 };
     }
 
-    await fallbackLevel3and4(session, currentEta);
-    await setFallbackStage(sessionId, 'AI_AND_HOSPITAL_ESCALATED');
-    logger.info(`Fallback stage AI_AND_HOSPITAL_ESCALATED session=${sessionId}`);
-    return { stage: 'AI_AND_HOSPITAL_ESCALATED', improved: false };
+    await fallbackLevel3(session, currentEta);
+    await setFallbackStage(sessionId, 'AI_ASSISTANCE_PROVIDED');
+    logger.info(`Fallback stage AI_ASSISTANCE_PROVIDED session=${sessionId}`);
+    return { stage: 'AI_ASSISTANCE_PROVIDED', improved: false };
   }
 
   // AI/hospital escalation is not the end of the dispatch search. A replacement
   // driver can come online later, so periodically retry L2 without repeating AI/webhook.
-  if (stage === 'AI_AND_HOSPITAL_ESCALATED') {
+  if (stage === 'AI_ASSISTANCE_PROVIDED') {
     const stageAt = Number(await redis.get(stageAtKey(sessionId))) || Date.now();
     const ageSeconds = Math.floor((Date.now() - stageAt) / 1000);
     const retrySeconds = getLateReplacementRetrySeconds();
@@ -111,7 +111,7 @@ async function triggerFallback(sessionId, currentEta, context = {}) {
       return { stage: 'AMBULANCE_SWAPPED', ...l2 };
     }
 
-    await setFallbackStage(sessionId, 'AI_AND_HOSPITAL_ESCALATED');
+    await setFallbackStage(sessionId, 'AI_ASSISTANCE_PROVIDED');
     logger.debug(`No late replacement yet session=${sessionId}; retrying in ${retrySeconds}s`);
     return { stage, waitingForReplacement: true, retrySeconds };
   }
@@ -357,7 +357,7 @@ async function fallbackLevel2(session, currentEta, { stalled = false } = {}) {
   }
 }
 
-async function fallbackLevel3and4(session, currentEta) {
+async function fallbackLevel3(session, currentEta) {
   try {
     const { generateDelayMessage } = require('./ai/delayMessageService');
     const delayEvent = [...(session.eventLog || [])].reverse().find((e) => e.status === 'DELAYED');
@@ -378,30 +378,10 @@ async function fallbackLevel3and4(session, currentEta) {
     logger.error(`Fallback L3 error: ${err.message}`);
   }
 
-  try {
-    const payload = {
-      sessionId: session._id,
-      emergencyType: session.emergencyType,
-      severityLevel: session.severityLevel,
-      patientLocation: session.location,
-      ambulanceDelayed: true,
-      currentEta,
-      timestamp: new Date().toISOString(),
-    };
+  // External hospital webhooks are not part of the deployed system.
+  // The application shows previously ranked hospital options instead.
+  // Integrations requiring a verified recipient must be implemented separately.
 
-    if (process.env.HOSPITAL_WEBHOOK_URL) {
-      await axios.post(process.env.HOSPITAL_WEBHOOK_URL, payload, { timeout: 5000 });
-    }
-
-    const liveSession = await EmergencySession.findById(session._id);
-    liveSession.addEvent('HOSPITAL_WEBHOOK_TRIGGERED', {
-      delivered: Boolean(process.env.HOSPITAL_WEBHOOK_URL),
-      payload,
-    });
-    await liveSession.save();
-  } catch (err) {
-    logger.error(`Fallback L4 error: ${err.message}`);
-  }
 }
 
 module.exports = { triggerFallback, clearFallbackStage };
