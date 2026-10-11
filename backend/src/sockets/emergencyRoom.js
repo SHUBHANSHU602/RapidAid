@@ -9,6 +9,22 @@ const logger = require('../utils/logger');
 
 let io;
 const etaIntervals = new Map();
+const driverConnections = new Map();
+const driverUserKey = id => String(id);
+function rememberDriverConnection(driverId, socketId) {
+  const key = driverUserKey(driverId);
+  if (!driverConnections.has(key)) driverConnections.set(key, new Set());
+  driverConnections.get(key).add(socketId);
+}
+function forgetDriverConnection(driverId, socketId) {
+  const key = driverUserKey(driverId);
+  const members = driverConnections.get(key);
+  if (!members) return 0;
+  members.delete(socketId);
+  if (!members.size) driverConnections.delete(key);
+  return members.size;
+}
+
 
 function initSocket(server) {
   const { Server } = require('socket.io');
@@ -50,6 +66,7 @@ function initSocket(server) {
     logger.info(`Socket connected ${socket.id} user=${socket.user.userId} role=${role}`);
 
     if (role === 'driver') {
+      rememberDriverConnection(socket.user.userId, socket.id);
       socket.join(`driver:${socket.user.userId}`);
       try {
         const ambulance = await Ambulance.findOne({ driverId: socket.user.userId }).lean();
@@ -182,13 +199,18 @@ function initSocket(server) {
     });
 
     socket.on('disconnect', async () => {
-      if (socket.ambulanceId) {
-        try { await setAmbulanceOnline(socket.ambulanceId, false); } catch (err) { logger.warn(err.message); }
+      if (socket.ambulanceId && role === 'driver') {
+        // Keep a driver online while another connection on this instance is alive.
+        const remaining = forgetDriverConnection(socket.user.userId, socket.id);
+        if (remaining === 0) {
+          try { await setAmbulanceOnline(socket.ambulanceId, false); } catch (err) { logger.warn(err.message); }
+        }
       }
 
       if (!socket.currentSessionId) return;
       const sessionId = socket.currentSessionId;
-      stopETAInterval(sessionId);
+      // A different socket may still be monitoring this session.
+      if (!Array.from(io.sockets.sockets.values()).some(peer => peer.id !== socket.id && peer.currentSessionId === sessionId)) stopETAInterval(sessionId);
       const key = socket.ambulanceId ? `ambulance:${socket.ambulanceId}:location` : null;
       const raw = key ? await redis.get(key) : null;
       if (key && raw) await redis.expire(key, 300);
