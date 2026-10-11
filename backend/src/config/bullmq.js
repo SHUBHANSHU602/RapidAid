@@ -9,7 +9,7 @@ function getBullMQConnection() {
     password: url.password ? decodeURIComponent(url.password) : undefined,
     username: url.username ? decodeURIComponent(url.username) : undefined,
     tls: process.env.REDIS_URL.startsWith('rediss://') 
-      ? { rejectUnauthorized: false } 
+      ? { rejectUnauthorized: true } 
       : undefined,
     enableReadyCheck: false,
     maxRetriesPerRequest: null,
