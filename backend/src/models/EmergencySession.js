@@ -127,6 +127,8 @@ const emergencySessionSchema = new mongoose.Schema(
 );
 
 emergencySessionSchema.index({ userId: 1, status: 1 });
+// Database-backed guard against simultaneous active SOS creation.
+emergencySessionSchema.index({ userId: 1 }, { unique: true, partialFilterExpression: { status: { $in: ['INITIATED', 'ASSIGNED', 'EN_ROUTE', 'DELAYED'] } } });
 emergencySessionSchema.index({ status: 1, createdAt: -1 });
 emergencySessionSchema.index({ ambulanceId: 1 });
 
