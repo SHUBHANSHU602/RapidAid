@@ -22,6 +22,25 @@ function emitToRoom(room, event, data) {
 }
 
 // ── Helper: generate 4-digit OTP ─────────────────────────────────────────────
+
+function userOwnsSession(session, userId) {
+  return String(session.userId?._id || session.userId) === String(userId);
+}
+
+async function isAssignedDriver(session, userId) {
+  if (!session.ambulanceId) return false;
+  const ambulanceId = session.ambulanceId?._id || session.ambulanceId;
+  return Boolean(await Ambulance.exists({ _id: ambulanceId, driverId: userId }));
+}
+
+// Never authorize a driver merely because they have a DRIVER role.
+async function mayAccessSession(session, user, { owner = true, driver = true, admin = true } = {}) {
+  const role = String(user.role).toUpperCase();
+  if (admin && role === 'ADMIN') return true;
+  if (owner && userOwnsSession(session, user.userId)) return true;
+  return driver && role === 'DRIVER' && await isAssignedDriver(session, user.userId);
+}
+
 function generateOTP() {
   return Math.floor(1000 + Math.random() * 9000).toString();
 }
@@ -181,11 +200,7 @@ exports.getSession = async (req, res, next) => {
       return next(new AppError('Session not found', 404));
     }
 
-    const isOwner = session.userId?._id?.toString() === req.user.userId.toString();
-    const isAdmin = req.user.role.toLowerCase() === 'admin';
-    const isDriver = req.user.role.toLowerCase() === 'driver';
-
-    if (!isOwner && !isAdmin && !isDriver) {
+    if (!await mayAccessSession(session, req.user)) {
       return next(new AppError('Not authorized to view this session', 403));
     }
 
@@ -201,8 +216,13 @@ exports.getSession = async (req, res, next) => {
 // ── GET /api/v1/emergency ─────────────────────────────────────────────────────
 exports.getAllSessions = async (req, res, next) => {
   try {
-    const isAdmin = req.user.role.toLowerCase() === 'admin';
-    const filter = isAdmin ? {} : { userId: req.user.userId };
+    const role = String(req.user.role).toUpperCase();
+    let filter;
+    if (role === 'ADMIN') filter = {};
+    else if (role === 'DRIVER') {
+      const ambulance = await Ambulance.findOne({ driverId: req.user.userId }).lean();
+      filter = ambulance ? { ambulanceId: ambulance._id } : { _id: { $in: [] } };
+    } else filter = { userId: req.user.userId };
 
     const sessions = await EmergencySession.find(filter)
       .sort({ createdAt: -1 })
@@ -235,12 +255,10 @@ exports.transitionSession = async (req, res, next) => {
     const session = await EmergencySession.findById(req.params.id);
     if (!session) return next(new AppError('Session not found', 404));
 
-    const isOwner = session.userId.toString() === req.user.userId;
-    const isAdmin = req.user.role.toLowerCase() === 'admin';
-    const isDriver = req.user.role.toLowerCase() === 'driver';
-
-    if (!isOwner && !isAdmin && !isDriver) {
-      return next(new AppError('Not authorized', 403));
+    // General lifecycle transitions belong to assigned drivers or admins.
+    // Patients may cancel via the dedicated endpoint.
+    if (!await mayAccessSession(session, req.user, { owner: false })) {
+      return next(new AppError('Only the assigned driver or an admin may change trip state', 403));
     }
 
     const allowed = validTransitions[session.status] || [];
@@ -371,15 +389,30 @@ exports.confirmArrival = async (req, res, next) => {
       return res.status(200).json({ success: true, message: 'Already confirmed', data: session });
     }
 
+    if (!await mayAccessSession(session, req.user, { owner: false })) {
+      return next(new AppError('Only the assigned driver may confirm arrival', 403));
+    }
+    if (!['ASSIGNED', 'EN_ROUTE', 'DELAYED'].includes(session.status) || !session.ambulanceId) {
+      return next(new AppError('No active assigned ambulance for this session', 409));
+    }
     const severity = session.severityLevel || 3;
 
     // Severity 4-5: GPS proximity check (within 100m)
     if (severity >= 4) {
       const { haversineDistance } = require('../services/mapsService');
-      const distanceKm = haversineDistance(
-        driverLat, driverLng,
-        session.location.lat, session.location.lng
-      );
+      // Client coordinates are untrusted for confirmation; use authenticated GPS cache.
+      const locationRaw = await redis.get(`ambulance:${session.ambulanceId}:location`);
+      if (!locationRaw) return next(new AppError('Fresh ambulance GPS is required', 409));
+      let location;
+      try { location = JSON.parse(locationRaw); } catch { return next(new AppError('Invalid GPS cache', 409)); }
+      const updatedAt = Date.parse(location.updatedAt || '');
+      if (!Number.isFinite(updatedAt) || Date.now() - updatedAt > 60000) {
+        return next(new AppError('Ambulance GPS is stale', 409));
+      }
+      const lat = Number(location.lat ?? location.latitude);
+      const lng = Number(location.lng ?? location.longitude);
+      if (!Number.isFinite(lat) || !Number.isFinite(lng)) return next(new AppError('Invalid GPS coordinates', 409));
+      const distanceKm = haversineDistance(lat, lng, session.location.lat, session.location.lng);
       const distanceMeters = distanceKm * 1000;
 
       if (distanceMeters > 200) {
@@ -436,6 +469,12 @@ exports.generateArrivalOtp = async (req, res, next) => {
     const session = await EmergencySession.findById(req.params.id);
     if (!session) return next(new AppError('Session not found', 404));
 
+    if (!await mayAccessSession(session, req.user, { driver: false })) {
+      return next(new AppError('Only the patient or admin may request arrival OTP', 403));
+    }
+    if (!session.ambulanceId || !['ASSIGNED','EN_ROUTE','DELAYED'].includes(session.status)) {
+      return next(new AppError('No active ambulance assignment', 409));
+    }
     const severity = session.severityLevel || 3;
     if (severity >= 4) {
       return next(new AppError('High severity sessions use GPS confirmation, not OTP', 400));
@@ -445,13 +484,7 @@ exports.generateArrivalOtp = async (req, res, next) => {
     // Store in Redis for 10 minutes
     await redis.set(`session:${session._id}:arrival_otp`, otp, 'EX', 600);
 
-    // Emit OTP to patient/bystander screen
-    emitToRoom(`session:${session._id}`, 'arrival_otp_generated', {
-      sessionId: session._id,
-      otp,
-      message: 'Share this code with the driver when they arrive',
-      expiresInMinutes: 10,
-    });
+    // OTP is returned only to the authorized requester, not broadcast to drivers.
 
     res.status(200).json({
       success: true,
@@ -471,6 +504,11 @@ exports.getRouteToDestination = async (req, res, next) => {
       return next(new AppError('Driver role required', 403));
     }
 
+    const session = await EmergencySession.findById(req.params.id);
+    if (!session) return next(new AppError('Session not found', 404));
+    if (!await mayAccessSession(session, req.user, { owner: false })) {
+      return next(new AppError('Not assigned to this emergency', 403));
+    }
     const { driverLat, driverLng, destinationLat, destinationLng, destinationName } = req.body;
 
     if (!driverLat || !driverLng || !destinationLat || !destinationLng) {
@@ -510,6 +548,7 @@ exports.sendChatMessage = async (req, res, next) => {
     const session = await EmergencySession.findById(req.params.id);
     if (!session) return next(new AppError('Session not found', 404));
 
+    if (!await mayAccessSession(session, req.user)) return next(new AppError('Not authorized for session chat', 403));
     const chatMessage = {
       senderId: req.user.userId,
       senderRole: req.user.role.toUpperCase(),
@@ -541,6 +580,8 @@ exports.getChatHistory = async (req, res, next) => {
 
     if (!session) return next(new AppError('Session not found', 404));
 
+    if (!await mayAccessSession(session, req.user)) return next(new AppError('Not authorized for session chat', 403));
+
     res.status(200).json({
       success: true,
       data: session.chatMessages,
@@ -561,6 +602,9 @@ exports.getDriverReplies = async (req, res, next) => {
     const session = await EmergencySession.findById(req.params.id).lean();
     if (!session) return res.status(404).json({ success: false, message: 'Session not found' });
 
+    if (!await mayAccessSession(session, req.user, { owner: false })) {
+      return next(new AppError('Not assigned to this emergency', 403));
+    }
     const { lastPatientMessage, etaMinutes = 5 } = req.body;
     if (!lastPatientMessage || lastPatientMessage.trim().length === 0) {
       return res.status(400).json({ success: false, message: 'lastPatientMessage is required' });
