@@ -1,4 +1,3 @@
-const axios = require('axios');
 const EmergencySession = require('../models/EmergencySession');
 const Ambulance = require('../models/Ambulance');
 const { getSingleETA } = require('./mapsService');
