@@ -1,26 +1,16 @@
 const { createLogger, format, transports } = require('winston');
 
+// Emit machine-readable logs to stdout/stderr so hosted services can collect
+// them without relying on local disk or an extra logging service.
 const logger = createLogger({
-  level: process.env.NODE_ENV === 'production' ? 'info' : 'debug',
+  level: process.env.LOG_LEVEL || (process.env.NODE_ENV === 'production' ? 'info' : 'debug'),
+  defaultMeta: { service: 'rapidaid-api' },
   format: format.combine(
-    format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }),
+    format.timestamp(),
     format.errors({ stack: true }),
     format.json()
   ),
-  transports: [
-    new transports.Console({
-      format: format.combine(
-        format.colorize(),
-        format.printf(({ timestamp, level, message, stack }) => {
-          return stack
-            ? `${timestamp} [${level}]: ${message}\n${stack}`
-            : `${timestamp} [${level}]: ${message}`;
-        })
-      )
-    }),
-    new transports.File({ filename: 'logs/error.log', level: 'error' }),
-    new transports.File({ filename: 'logs/combined.log' })
-  ]
+  transports: [new transports.Console()]
 });
 
 module.exports = logger;
