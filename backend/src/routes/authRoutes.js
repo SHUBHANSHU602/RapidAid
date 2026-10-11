@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
-const { register, login, refreshToken, getMe, logout } = require('../controllers/authController');
-const { protect } = require('../middleware/auth');
+const { register, login, refreshToken, getMe, logout, createDriver } = require('../controllers/authController');
+const { protect, restrictTo } = require('../middleware/auth');
 const validate = require('../middleware/validate');
 const { body } = require('express-validator');
 
@@ -17,6 +17,7 @@ const loginValidation = [
 ];
 
 router.post('/register', validate(registerValidation), register);
+router.post('/drivers', protect, restrictTo('ADMIN'), validate(registerValidation), createDriver);
 router.post('/login', validate(loginValidation), login);
 router.post('/refresh-token', refreshToken);
 router.get('/me', protect, getMe);
