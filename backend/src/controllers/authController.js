@@ -6,13 +6,14 @@ const jwt = require('jsonwebtoken');
 exports.register = async (req, res, next) => {
   try {
     const { name, email, password, role } = req.body;
+    if (role && role !== 'USER') return next(new AppError('Public registration cannot grant privileged roles', 403));
 
     const existingUser = await User.findOne({ email });
     if (existingUser) {
       return next(new AppError('Email already registered', 400));
     }
 
-    const user = await User.create({ name, email, password, role });
+    const user = await User.create({ name, email, password, role: 'USER' });
 
     const accessToken = generateAccessToken(user._id, user.role);
     const refreshToken = generateRefreshToken(user._id);
@@ -125,4 +126,12 @@ exports.logout = async (req, res, next) => {
   } catch (err) {
     next(err);
   }
+};
+// Operational drivers are onboarded by an authenticated admin.
+exports.createDriver = async (req, res, next) => {
+  try {
+    const { name, email, password } = req.body;
+    const driver = await User.create({ name, email, password, role: 'DRIVER' });
+    return res.status(201).json({ success: true, user: { id: driver.id, name: driver.name, email: driver.email, role: driver.role } });
+  } catch (err) { next(err); }
 };
