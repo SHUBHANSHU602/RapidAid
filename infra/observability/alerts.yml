@@ -1,0 +1,30 @@
+groups:
+  - name: rapidaid-api
+    rules:
+      - alert: RapidAidAPIDown
+        expr: up{job="rapidaid-api"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "RapidAid API scrape is down"
+      - alert: RapidAidHighHTTPErrorRate
+        expr: |
+          sum(rate(rapidaid_http_requests_total{status=~"5.."}[5m]))
+          /
+          clamp_min(sum(rate(rapidaid_http_requests_total[5m])), 0.001) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "More than 5% of RapidAid HTTP requests are failing"
+      - alert: RapidAidHighP95RequestLatency
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le) (rate(rapidaid_http_request_duration_seconds_bucket[5m]))
+          ) > 2
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "RapidAid HTTP p95 latency exceeds two seconds"
