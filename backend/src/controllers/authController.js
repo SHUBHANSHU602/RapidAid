@@ -2,6 +2,8 @@ const User = require('../models/User');
 const AppError = require('../utils/AppError');
 const { generateAccessToken, generateRefreshToken } = require('../utils/generateTokens');
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
+const hashToken = token => crypto.createHash('sha256').update(token).digest('hex');
 
 exports.register = async (req, res, next) => {
   try {
@@ -17,6 +19,7 @@ exports.register = async (req, res, next) => {
 
     const accessToken = generateAccessToken(user._id, user.role);
     const refreshToken = generateRefreshToken(user._id);
+    await User.findByIdAndUpdate(user._id, { refreshTokenHash: hashToken(refreshToken) });
 
     res.status(201).json({
       success: true,
@@ -51,6 +54,7 @@ exports.login = async (req, res, next) => {
 
     const accessToken = generateAccessToken(user._id, user.role);
     const refreshToken = generateRefreshToken(user._id);
+    await User.findByIdAndUpdate(user._id, { refreshTokenHash: hashToken(refreshToken) });
 
     res.status(200).json({
       success: true,
@@ -90,6 +94,11 @@ exports.refreshToken = async (req, res, next) => {
 
     const newAccessToken = generateAccessToken(user._id, user.role);
     const newRefreshToken = generateRefreshToken(user._id);
+    const rotated = await User.findOneAndUpdate(
+      { _id: user._id, refreshTokenHash: hashToken(refreshToken) },
+      { $set: { refreshTokenHash: hashToken(newRefreshToken) } }
+    );
+    if (!rotated) return next(new AppError('Refresh token revoked or already used', 401));
 
     res.status(200).json({
       success: true,
@@ -119,6 +128,7 @@ exports.getMe = async (req, res, next) => {
 
 exports.logout = async (req, res, next) => {
   try {
+    await User.updateOne({ _id: req.user.userId }, { $unset: { refreshTokenHash: '' } });
     res.status(200).json({
       success: true,
       message: 'Logged out successfully'
