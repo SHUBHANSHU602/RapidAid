@@ -142,3 +142,17 @@ describe('Emergency Session — Full Lifecycle', () => {
   });
 
 });
+describe('Emergency access — unauthorized participant', () => {
+  test('unassigned driver cannot read or mutate an unrelated emergency', async () => {
+    const email = 'unassigned-driver-access@test.com';
+    await User.deleteOne({ email });
+    await User.create({ name: 'Unassigned Driver', email, password: 'Test@1234', role: 'DRIVER' });
+    const login = await request(app).post('/api/v1/auth/login').send({ email, password: 'Test@1234' });
+    const auth = `Bearer ${login.body.accessToken}`;
+    expect((await request(app).get(`/api/v1/emergency/${sessionId}`).set('Authorization', auth)).status).toBe(403);
+    expect((await request(app).get(`/api/v1/emergency/${sessionId}/chat`).set('Authorization', auth)).status).toBe(403);
+    expect((await request(app).post(`/api/v1/emergency/${sessionId}/transition`).set('Authorization', auth).send({ status: 'EN_ROUTE' })).status).toBe(403);
+    expect((await request(app).post(`/api/v1/emergency/${sessionId}/arrive`).set('Authorization', auth).send({ driverLat: 25.3176, driverLng: 82.9739 })).status).toBe(403);
+    await User.deleteOne({ email });
+  });
+});
