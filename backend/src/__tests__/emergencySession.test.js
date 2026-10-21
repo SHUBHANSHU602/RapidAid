@@ -70,6 +70,8 @@ describe('EmergencySession — addEvent()', () => {
   let session;
 
   beforeEach(async () => {
+    // Isolate each case under the active-emergency unique index.
+    await EmergencySession.deleteMany({ userId: testUserId });
     session = await EmergencySession.create(makeSession());
   });
 
