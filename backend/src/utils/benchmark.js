@@ -12,12 +12,14 @@ async function runBenchmark() {
   }
 
   await mongoose.connect(process.env.MONGO_URI);
-  const user = await User.findOne({ role: 'USER' }).lean();
-  if (!user) throw new Error('Create a benchmark-only USER in an isolated database first');
+  const runId = Date.now();
+  const testUsers = [];
   const latencies = [];
   const ids = [];
   for (let i = 0; i < 5; i++) {
     const coords = { lat: 25.3176 + i * 0.001, lng: 82.9739 + i * 0.001 };
+    const user = await User.create({ name: 'Benchmark User', email: `rapidaid-benchmark-${runId}-${i}@example.invalid`, password: require('crypto').randomBytes(16).toString('hex'), role: 'USER' });
+    testUsers.push(user._id);
     const session = await EmergencySession.create({
       userId: user._id, location: coords, emergencyType: 'CARDIAC', severityLevel: 3
     });
@@ -44,6 +46,7 @@ async function runBenchmark() {
     }
     await EmergencySession.deleteOne({ _id: id });
   }
+  await User.deleteMany({ _id: { $in: testUsers } });
   await mongoose.disconnect();
 }
 runBenchmark().catch(err => { console.error(err.message); process.exitCode = 1; });
