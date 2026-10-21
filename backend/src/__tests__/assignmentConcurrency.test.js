@@ -8,6 +8,7 @@ jest.mock('../sockets/emergencyRoom', () => ({
   getIO: () => ({ to: () => ({ emit: () => {} }) })
 }));
 const { assignAmbulance } = require('../services/assignmentService');
+const { reconcileAssignments } = require('../services/assignmentReconciliation');
 
 describe('Assignment: simultaneous patients competing for one ambulance', () => {
   let users = [], ambulance, sessions = [];
@@ -63,4 +64,23 @@ describe('Assignment: simultaneous patients competing for one ambulance', () => 
     expect(String(persistentAmbulance.assignedSessionId)).toBe(String(docs.find(s => s.status === 'ASSIGNED')._id));
     expect(await redis.get(`ambulance:${ambulance._id}:status`)).toBe('BUSY');
   });
+  test('reconciler restores BUSY in Redis for a durably assigned ambulance', async () => {
+    const id = ambulance._id.toString();
+    await redis.set(`ambulance:${id}:status`, 'AVAILABLE');
+    await redis.sadd('ambulance:available', id);
+    await reconcileAssignments();
+    expect(await redis.get(`ambulance:${id}:status`)).toBe('BUSY');
+    expect(await redis.sismember('ambulance:available', id)).toBe(0);
+  });
+
+  test('reconciler removes stale AVAILABLE membership even if both statuses read BUSY', async () => {
+    const id = ambulance._id.toString();
+    await redis.set(`ambulance:${id}:status`, 'BUSY');
+    await redis.sadd('ambulance:available', id);
+    await reconcileAssignments();
+    expect(await redis.get(`ambulance:${id}:status`)).toBe('BUSY');
+    expect(await redis.sismember('ambulance:available', id)).toBe(0);
+  });
+
+
 });
