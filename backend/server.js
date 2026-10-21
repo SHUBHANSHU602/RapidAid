@@ -10,6 +10,7 @@ const { initSocket } = require('./src/sockets/emergencyRoom');
 require('./src/workers/mapsQueue.worker');
 const { scheduleDelayDetection } = require('./src/workers/delayDetection.worker');
 const { recoverPendingDispatches } = require('./src/services/dispatchQueue');
+const { reconcileAssignments } = require('./src/services/assignmentReconciliation');
 const { startDispatchWorker } = require('./src/workers/dispatch.worker');
 const PORT = process.env.PORT || 5000;
 
@@ -86,6 +87,16 @@ const startServer = async () => {
   await recoverActiveDelayMonitors();
   startDispatchWorker();
   await recoverPendingDispatches();
+  try {
+    await reconcileAssignments();
+  } catch (error) {
+    logger.warn('Initial assignment reconciliation failed', error.message);
+  }
+  const reconciliationTimer = setInterval(() => {
+    reconcileAssignments().catch(error =>
+      logger.warn('Periodic assignment reconciliation failed', error.message));
+  }, 60000);
+  reconciliationTimer.unref();
 
   httpServer.listen(PORT, () => {
     logger.info(`RapidAid server running on port ${PORT} in ${process.env.NODE_ENV} mode`);
