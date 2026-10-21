@@ -21,6 +21,20 @@ function emitToRoom(room, event, data) {
   }
 }
 
+
+// Release only the ambulance that is still owned by this emergency.
+// Update Mongo first; Redis can be reconstructed from durable Mongo state.
+async function releaseAssignedAmbulance(session) {
+  if (!session.ambulanceId) return;
+  const updated = await Ambulance.updateOne(
+    { _id: session.ambulanceId, assignedSessionId: session._id },
+    { $set: { status: 'AVAILABLE', assignedSessionId: null } }
+  );
+  if (updated.modifiedCount) {
+    await updateAmbulanceStatus(session.ambulanceId.toString(), 'AVAILABLE');
+  }
+}
+
 // ── Helper: generate 4-digit OTP ─────────────────────────────────────────────
 
 function userOwnsSession(session, userId) {
@@ -207,29 +221,21 @@ exports.transitionSession = async (req, res, next) => {
     }
 
     const previousStatus = session.status;
-    session.status = status;
-    session.addEvent(status, { previousStatus, ...metadata });
-
-    if (status === 'RESOLVED') {
-      session.resolvedAt = new Date();
-    }
-
-    await session.save();
+    const changes = { $set: { status },
+      $push: { eventLog: { status, timestamp: new Date(), meta: { previousStatus, ...metadata } } } };
+    if (status === 'RESOLVED') changes.$set.resolvedAt = new Date();
+    const updated = await EmergencySession.findOneAndUpdate(
+      { _id: session._id, status: previousStatus, ambulanceId: session.ambulanceId },
+      changes,
+      { new: true }
+    );
+    if (!updated) return next(new AppError('Emergency state changed concurrently. Retry.', 409));
 
     if (['RESOLVED', 'CANCELLED'].includes(status)) {
-      await stopDispatch(session._id).catch(err => logger.warn(err.message));
-      try { await cancelDelayDetection(session._id.toString()); } catch (e) { }
-      if (session.ambulanceId) {
-        try {
-          await updateAmbulanceStatus(session.ambulanceId.toString(), 'AVAILABLE');
-          await Ambulance.findByIdAndUpdate(session.ambulanceId, {
-            status: 'AVAILABLE',
-            assignedSessionId: null,
-          });
-        } catch (e) {
-          logger.warn('Failed to reset ambulance on resolve', e.message);
-        }
-      }
+      await stopDispatch(updated._id).catch(err => logger.warn(err.message));
+      try { await cancelDelayDetection(updated._id.toString()); } catch (e) {}
+      try { await releaseAssignedAmbulance(updated); }
+      catch (error) { logger.warn('Assigned ambulance release needs reconciliation', error.message); }
     }
 
     emitToRoom(`session:${session._id}`, 'session_status_changed', {
@@ -240,7 +246,7 @@ exports.transitionSession = async (req, res, next) => {
       changedAt: new Date().toISOString(),
     });
 
-    res.status(200).json({ success: true, data: session });
+    res.status(200).json({ success: true, data: updated });
   } catch (err) {
     next(err);
   }
@@ -261,27 +267,18 @@ exports.cancelEmergency = async (req, res, next) => {
     }
 
     const previousStatus = session.status;
-    session.status = 'CANCELLED';
-    session.addEvent('CANCELLED', {
-      previousStatus,
-      cancelledBy: req.user.userId,
-      cancelledAt: new Date().toISOString(),
-    });
-    await session.save();
-    await stopDispatch(session._id).catch(err => logger.warn(err.message));
+    const cancelled = await EmergencySession.findOneAndUpdate(
+      { _id: session._id, status: previousStatus, ambulanceId: session.ambulanceId },
+      { $set: { status: 'CANCELLED' },
+        $push: { eventLog: { status: 'CANCELLED', timestamp: new Date(),
+          meta: { previousStatus, cancelledBy: req.user.userId, cancelledAt: new Date().toISOString() } } } },
+      { new: true }
+    );
+    if (!cancelled) return next(new AppError('Emergency state changed concurrently. Retry cancellation.', 409));
+    await stopDispatch(cancelled._id).catch(err => logger.warn(err.message));
 
-    // Free ambulance if assigned
-    if (session.ambulanceId) {
-      try {
-        await updateAmbulanceStatus(session.ambulanceId.toString(), 'AVAILABLE');
-        await Ambulance.findByIdAndUpdate(session.ambulanceId, {
-          status: 'AVAILABLE',
-          assignedSessionId: null,
-        });
-      } catch (e) {
-        logger.warn('Cancel: failed to free ambulance', e.message);
-      }
-    }
+    try { await releaseAssignedAmbulance(cancelled); }
+    catch (error) { logger.warn('Cancelled ambulance release needs reconciliation', error.message); }
 
     // Cancel delay detection
     try {
@@ -305,7 +302,7 @@ exports.cancelEmergency = async (req, res, next) => {
     res.status(200).json({
       success: true,
       message: 'Emergency cancelled successfully',
-      data: session,
+      data: cancelled,
     });
   } catch (err) {
     next(err);
