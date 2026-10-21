@@ -50,7 +50,7 @@ export default function TriggerModal({ isOpen, onClose }) {
         severityLevel: parseInt(severity),
         description: description
       });
-      toast.success('Ambulance dispatched!');
+      toast.success('SOS received. Searching for an available ambulance…');
       onClose();
       navigate(`/emergency/${session.sessionId || session._id}`);
     } catch (err) {
