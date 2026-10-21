@@ -2,7 +2,13 @@ const Groq = require('groq-sdk');
 const Bottleneck = require('bottleneck');
 const logger = require('../../utils/logger');
 
-const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+// Initialize lazily: SOS and the test suite must work without an AI API key.
+let groq;
+function getGroq() {
+  if (!process.env.GROQ_API_KEY) throw new Error('Groq is not configured');
+  if (!groq) groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+  return groq;
+}
 
 // Token bucket rate limiter
 // Groq free tier: ~30 requests/minute
@@ -31,7 +37,7 @@ async function callGroq(messages, options = {}) {
   const attempt = async (retriesLeft) => {
     try {
       const completion = await limiter.schedule(() =>
-        groq.chat.completions.create({
+        getGroq().chat.completions.create({
           messages,
           model,
           temperature,
