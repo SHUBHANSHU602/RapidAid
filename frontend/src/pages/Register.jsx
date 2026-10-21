@@ -52,7 +52,7 @@ export default function Register() {
           <div className="space-y-4 max-w-sm text-left mx-auto">
             <div className="glass p-4 rounded-xl flex gap-3">
               <ShieldAlert className="w-6 h-6 text-accent-red shrink-0" />
-              <p className="text-sm text-text-muted">Instant AI triage matches you with the nearest ambulance in under 300ms.</p>
+              <p className="text-sm text-text-muted">Create an emergency request and track dispatch updates as an ambulance becomes available.</p>
             </div>
             <div className="glass p-4 rounded-xl flex gap-3">
               <Ambulance className="w-6 h-6 text-accent-blue shrink-0" />
