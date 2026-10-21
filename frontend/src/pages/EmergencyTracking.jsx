@@ -184,13 +184,11 @@ export default function EmergencyTracking() {
     : 0;
 
   // ── Ambulance location for map ──────────────────────────────────────────────
+  const storedAmbulanceLocation = activeSession?.ambulanceId?.currentLocation;
   const ambulanceLoc = driverPosition
     ? driverPosition
-    : activeSession?.ambulanceId?.currentLocation?.coordinates
-      ? {
-          lng: activeSession.ambulanceId.currentLocation.coordinates[0],
-          lat: activeSession.ambulanceId.currentLocation.coordinates[1],
-        }
+    : Number.isFinite(storedAmbulanceLocation?.lat) && Number.isFinite(storedAmbulanceLocation?.lng)
+      ? { lat: storedAmbulanceLocation.lat, lng: storedAmbulanceLocation.lng }
       : null;
 
   // ═══════════════════════════════════════════════════════════════════════════════
