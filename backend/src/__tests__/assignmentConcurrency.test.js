@@ -8,6 +8,7 @@ jest.mock('../sockets/emergencyRoom', () => ({
   getIO: () => ({ to: () => ({ emit: () => {} }) })
 }));
 const { assignAmbulance } = require('../services/assignmentService');
+const { updateAmbulanceStatus } = require('../services/ambulanceCache');
 
 describe('Assignment: simultaneous patients competing for one ambulance', () => {
   let users = [], ambulance, sessions = [];
@@ -62,5 +63,8 @@ describe('Assignment: simultaneous patients competing for one ambulance', () => 
     const persistentAmbulance = await Ambulance.findById(ambulance._id);
     expect(String(persistentAmbulance.assignedSessionId)).toBe(String(docs.find(s => s.status === 'ASSIGNED')._id));
     expect(await redis.get(`ambulance:${ambulance._id}:status`)).toBe('BUSY');
+    await expect(updateAmbulanceStatus(ambulance._id, 'AVAILABLE')).rejects.toThrow('still has an assigned session');
+    expect(await redis.get(`ambulance:${ambulance._id}:status`)).toBe('BUSY');
+    expect(await redis.sismember('ambulance:available', ambulance._id.toString())).toBe(0);
   });
 });
