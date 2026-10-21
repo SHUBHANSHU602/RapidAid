@@ -67,6 +67,24 @@ app.get('/api/v1/health', async (req, res) => {
   }
 });
 
+// Metrics require a scraper-specific secret and are not publicly accessible.
+app.get('/internal/metrics', (req, res) => {
+  const key = process.env.METRICS_TOKEN;
+  const presented = (req.headers.authorization || '').replace(/^Bearer /, '');
+  if (!key || presented !== key) return res.status(404).end();
+  res.type('text/plain; version=0.0.4; charset=utf-8');
+  return res.send(require('./src/services/metrics').serialize());
+});
+
+app.get('/internal/live', (req, res) => res.status(200).send('ok'));
+app.get('/internal/ready', async (req, res) => {
+  try {
+    if (mongoose.connection.readyState !== 1) return res.status(503).json({ ready: false });
+    await redis.ping();
+    return res.status(200).json({ ready: true });
+  } catch { return res.status(503).json({ ready: false }); }
+});
+
 // Routes
 app.use('/api/v1/auth', authRoutes);
 app.use('/api/v1/ambulances', ambulanceRoutes);
