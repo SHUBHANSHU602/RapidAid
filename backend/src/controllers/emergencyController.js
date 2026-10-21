@@ -1,7 +1,7 @@
 const EmergencySession = require('../models/EmergencySession');
 const Ambulance = require('../models/Ambulance');
 const AppError = require('../utils/AppError');
-const { assignAmbulance } = require('../services/assignmentService');
+const { scheduleDispatch, stopDispatch, enqueueAssistance } = require('../services/dispatchQueue');
 const { scheduleDelayDetection, cancelDelayDetection } = require('../workers/delayDetection.worker');
 const { updateAmbulanceStatus } = require('../services/ambulanceCache');
 const { getIO } = require('../sockets/emergencyRoom');
@@ -18,6 +18,20 @@ function emitToRoom(room, event, data) {
     getIO().to(room).emit(event, data);
   } catch (err) {
     logger.warn(`emitToRoom failed: ${room} ${event}`, err.message);
+  }
+}
+
+
+// Release only the ambulance that is still owned by this emergency.
+// Update Mongo first; Redis can be reconstructed from durable Mongo state.
+async function releaseAssignedAmbulance(session) {
+  if (!session.ambulanceId) return;
+  const updated = await Ambulance.updateOne(
+    { _id: session.ambulanceId, assignedSessionId: session._id },
+    { $set: { status: 'AVAILABLE', assignedSessionId: null } }
+  );
+  if (updated.modifiedCount) {
+    await updateAmbulanceStatus(session.ambulanceId.toString(), 'AVAILABLE');
   }
 }
 
@@ -67,49 +81,32 @@ exports.triggerEmergency = async (req, res, next) => {
     // Step 1: General first aid — instant, hardcoded, no AI needed
     const generalFirstAid = getGeneralFirstAid(emergencyType);
 
-    // Step 2: AI triage (only if description provided)
-    let triageResult = null;
-    let finalSeverity = severityLevel;
-
-    if (description && description.trim().length >= 5) {
-      try {
-        triageResult = await triageEmergency(description, emergencyType);
-        if (triageResult?.confidence === 'high') {
-          finalSeverity = triageResult.severity;
-          logger.info(`Triage override: user=${severityLevel} → ai=${finalSeverity}`);
-        }
-      } catch (err) {
-        logger.warn('Triage failed — using user-provided severity', err.message);
-      }
-    }
-
-    // Step 3: Hospital selection
-    let hospitalRanking = [];
-    let topHospitalId = null;
-
+    // Claim at most one active session per patient using a unique partial index.
+    let session;
     try {
-      hospitalRanking = await selectHospital(lat, lng, triageResult, emergencyType);
-      if (hospitalRanking.length > 0) {
-        topHospitalId = hospitalRanking[0].id;
-        logger.info(`Hospital selected: ${hospitalRanking[0].name}`);
-      }
-    } catch (err) {
-      logger.warn('Hospital selection failed', err.message);
+      session = await EmergencySession.create({
+        userId: req.user.userId,
+        location: { lat, lng }, emergencyType, description,
+        severityLevel, generalFirstAid, phase: 'PRE_ARRIVAL',
+      });
+    } catch (error) {
+      if (error.code === 11000) return next(new AppError('An active emergency already exists', 409));
+      throw error;
     }
 
-    // Step 4: Create session
-    const session = await EmergencySession.create({
-      userId: req.user.userId,
-      location: { lat, lng },
-      emergencyType,
-      description,
-      severityLevel: finalSeverity,
-      hospitalId: topHospitalId || null,
-      hospitalRanking,
-      generalFirstAid,
-      phase: 'PRE_ARRIVAL',
-    });
+    // Acknowledgement is only sent after durable dispatch scheduling succeeds.
+    try {
+      await scheduleDispatch(session._id);
+    } catch (error) {
+      await EmergencySession.deleteOne({ _id: session._id, status: 'INITIATED', ambulanceId: null });
+      throw error;
+    }
 
+    enqueueAssistance(session._id).catch(error =>
+      logger.warn('assistance_enqueue_failed', { sessionId: String(session._id), error: error.message })
+    );
+    const triageResult = null;
+    const hospitalRanking = [];
     // Step 5: Respond immediately — don't make patient wait for assignment
     res.status(201).json({
       success: true,
@@ -136,52 +133,6 @@ exports.triggerEmergency = async (req, res, next) => {
       });
     }, 1000);
 
-    // Step 7: Emit specialised first aid if description given (2s delay)
-    if (description && description.trim().length >= 5 && finalSeverity >= 4) {
-      setTimeout(async () => {
-        try {
-          const specialisedFirstAid = await generateFirstAid(emergencyType, finalSeverity, description);
-          if (specialisedFirstAid) {
-            emitToRoom(`session:${session._id}`, 'specialised_first_aid', {
-              sessionId: session._id,
-              ...specialisedFirstAid,
-            });
-          }
-        } catch (err) {
-          logger.warn('Specialised first aid generation failed', err.message);
-        }
-      }, 2000);
-    }
-
-    // Step 8: Assignment (fire and forget — 500ms delay)
-    setTimeout(() => {
-      assignAmbulance(session._id, lat, lng)
-        .then(async (result) => {
-          if (result) {
-            logger.info(`Assigned ambulance ${result.ambulanceId} in ${result.latency}ms`);
-
-            // Schedule delay detection
-            try {
-              const etaMinutes = Math.ceil((result.etaSeconds || 0) / 60) || 5;
-              await scheduleDelayDetection(session._id.toString(), etaMinutes);
-            } catch (err) {
-              logger.warn('Failed to schedule delay detection', err.message);
-            }
-
-            // Emit hospital ranking to session room after assignment
-            if (hospitalRanking.length > 0) {
-              emitToRoom(`session:${session._id}`, 'hospital_options', {
-                sessionId: session._id,
-                hospitalRanking,
-                message: 'Hospital options available',
-              });
-            }
-          }
-        })
-        .catch((err) => {
-          logger.error('Assignment failed:', err.message);
-        });
-    }, 500);
 
   } catch (err) {
     next(err);
@@ -270,28 +221,21 @@ exports.transitionSession = async (req, res, next) => {
     }
 
     const previousStatus = session.status;
-    session.status = status;
-    session.addEvent(status, { previousStatus, ...metadata });
-
-    if (status === 'RESOLVED') {
-      session.resolvedAt = new Date();
-    }
-
-    await session.save();
+    const changes = { $set: { status },
+      $push: { eventLog: { status, timestamp: new Date(), meta: { previousStatus, ...metadata } } } };
+    if (status === 'RESOLVED') changes.$set.resolvedAt = new Date();
+    const updated = await EmergencySession.findOneAndUpdate(
+      { _id: session._id, status: previousStatus, ambulanceId: session.ambulanceId },
+      changes,
+      { new: true }
+    );
+    if (!updated) return next(new AppError('Emergency state changed concurrently. Retry.', 409));
 
     if (['RESOLVED', 'CANCELLED'].includes(status)) {
-      try { await cancelDelayDetection(session._id.toString()); } catch (e) { }
-      if (session.ambulanceId) {
-        try {
-          await updateAmbulanceStatus(session.ambulanceId.toString(), 'AVAILABLE');
-          await Ambulance.findByIdAndUpdate(session.ambulanceId, {
-            status: 'AVAILABLE',
-            assignedSessionId: null,
-          });
-        } catch (e) {
-          logger.warn('Failed to reset ambulance on resolve', e.message);
-        }
-      }
+      await stopDispatch(updated._id).catch(err => logger.warn(err.message));
+      try { await cancelDelayDetection(updated._id.toString()); } catch (e) {}
+      try { await releaseAssignedAmbulance(updated); }
+      catch (error) { logger.warn('Assigned ambulance release needs reconciliation', error.message); }
     }
 
     emitToRoom(`session:${session._id}`, 'session_status_changed', {
@@ -302,7 +246,7 @@ exports.transitionSession = async (req, res, next) => {
       changedAt: new Date().toISOString(),
     });
 
-    res.status(200).json({ success: true, data: session });
+    res.status(200).json({ success: true, data: updated });
   } catch (err) {
     next(err);
   }
@@ -323,26 +267,18 @@ exports.cancelEmergency = async (req, res, next) => {
     }
 
     const previousStatus = session.status;
-    session.status = 'CANCELLED';
-    session.addEvent('CANCELLED', {
-      previousStatus,
-      cancelledBy: req.user.userId,
-      cancelledAt: new Date().toISOString(),
-    });
-    await session.save();
+    const cancelled = await EmergencySession.findOneAndUpdate(
+      { _id: session._id, status: previousStatus, ambulanceId: session.ambulanceId },
+      { $set: { status: 'CANCELLED' },
+        $push: { eventLog: { status: 'CANCELLED', timestamp: new Date(),
+          meta: { previousStatus, cancelledBy: req.user.userId, cancelledAt: new Date().toISOString() } } } },
+      { new: true }
+    );
+    if (!cancelled) return next(new AppError('Emergency state changed concurrently. Retry cancellation.', 409));
+    await stopDispatch(cancelled._id).catch(err => logger.warn(err.message));
 
-    // Free ambulance if assigned
-    if (session.ambulanceId) {
-      try {
-        await updateAmbulanceStatus(session.ambulanceId.toString(), 'AVAILABLE');
-        await Ambulance.findByIdAndUpdate(session.ambulanceId, {
-          status: 'AVAILABLE',
-          assignedSessionId: null,
-        });
-      } catch (e) {
-        logger.warn('Cancel: failed to free ambulance', e.message);
-      }
-    }
+    try { await releaseAssignedAmbulance(cancelled); }
+    catch (error) { logger.warn('Cancelled ambulance release needs reconciliation', error.message); }
 
     // Cancel delay detection
     try {
@@ -366,7 +302,7 @@ exports.cancelEmergency = async (req, res, next) => {
     res.status(200).json({
       success: true,
       message: 'Emergency cancelled successfully',
-      data: session,
+      data: cancelled,
     });
   } catch (err) {
     next(err);
