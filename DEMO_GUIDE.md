@@ -1,10 +1,10 @@
 # RapidAid — Two-Device Demo Guide
 
-This branch is designed for a real two-device demonstration: one patient account and one or more driver accounts.
+This guide describes an isolated two-device engineering demo, not real emergency assistance. It requires two test accounts and valid local or HTTPS geolocation.
 
 ## 1. Backend configuration
 
-Copy `backend/.env.example` to `backend/.env` and configure MongoDB, Redis, JWT secrets, Google Maps, Groq, and the frontend origin.
+Copy `backend/.env.example` to `backend/.env` and configure MongoDB, Redis, JWT secrets, and the frontend origin. Google Maps and Groq are optional.
 
 For a fast live demo set:
 
@@ -12,11 +12,11 @@ For a fast live demo set:
 DEMO_MODE=true
 ```
 
-In demo mode the delay worker checks every 15 seconds and treats roughly 30 seconds without meaningful movement as a stall. In normal mode the worker checks every 60 seconds and uses a 120-second stall threshold unless `STALL_THRESHOLD_SECONDS` is explicitly configured.
+In demo mode the delay worker checks every 15 seconds and treats roughly 30 seconds without meaningful movement as a stall. In normal mode the worker checks every 60 seconds and uses a 120-second stall threshold unless `STALL_THRESHOLD_SECONDS` is configured. Neither mode is clinically validated.
 
 ## 2. Seed demo accounts
 
-From `backend/` run:
+**Only with a dedicated, disposable local/demo MongoDB database:** set `ALLOW_DEMO_SEED=true` in `backend/.env` and then from `backend/` run:
 
 ```bash
 npm run seed
@@ -67,7 +67,7 @@ For swap demonstrations, repeat these steps on Device C with `driver2@rapidaid.c
 1. Log in as a normal user on Device A.
 2. Allow location access.
 3. Trigger an emergency.
-4. RapidAid creates the session, runs triage/hospital selection, and asynchronously assigns the best eligible ambulance.
+4. RapidAid persists and queues the session, returning `INITIATED` (not a confirmed assignment); AI assistance is computed asynchronously.
 5. The chosen driver's dashboard receives `driver_assignment` in real time.
 6. The patient tracking page receives `ambulance_assigned`.
 
@@ -94,7 +94,7 @@ With `DEMO_MODE=true`:
 6. Level 1 sends a reroute suggestion and a fresh navigation link.
 7. If rerouting does not materially improve ETA, Level 2 searches online available ambulances.
 8. If another ambulance improves ETA by more than two minutes, RapidAid swaps the assignment and notifies both drivers and the patient.
-9. If no better ambulance exists, Level 3 sends the AI delay message and Level 4 attempts the configured hospital webhook (or records the integration event when no webhook URL is configured).
+9. If no suitable ambulance is available, RapidAid may send an informational AI delay message and continue retrying replacement. **No hospital webhook is implemented.**
 
 ## Important demo conditions
 
