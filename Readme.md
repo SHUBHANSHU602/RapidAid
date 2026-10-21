@@ -1,548 +1,253 @@
-<div align="center">
+# RapidAid
 
-<h1>🚑 RapidAid</h1>
+**Emergency-dispatch coordination prototype** using React, Express, MongoDB, Redis, BullMQ and Socket.IO.
 
-<p><strong>Real-time AI-powered emergency ambulance dispatch & coordination system</strong></p>
+> **Status: engineering prototype, not an operational emergency service.** Do not rely on RapidAid to request real medical assistance. Use your local emergency number. This repository demonstrates software architecture; it has not been clinically validated or certified for real ambulance dispatch.
 
-<p>
-  <img src="https://img.shields.io/badge/Node.js-18.x-339933?style=flat-square&logo=node.js&logoColor=white"/>
-  <img src="https://img.shields.io/badge/Express-4.x-000000?style=flat-square&logo=express&logoColor=white"/>
-  <img src="https://img.shields.io/badge/MongoDB-Atlas-47A248?style=flat-square&logo=mongodb&logoColor=white"/>
-  <img src="https://img.shields.io/badge/Redis-Upstash-DC382D?style=flat-square&logo=redis&logoColor=white"/>
-  <img src="https://img.shields.io/badge/Socket.io-4.x-010101?style=flat-square&logo=socket.io&logoColor=white"/>
-  <img src="https://img.shields.io/badge/Groq-LLaMA_3-F55036?style=flat-square"/>
-  <img src="https://img.shields.io/badge/React-18.x-61DAFB?style=flat-square&logo=react&logoColor=black"/>
-  <img src="https://img.shields.io/badge/License-MIT-blue?style=flat-square"/>
-</p>
+RapidAid lets a patient start an emergency session, selects an eligible online ambulance, sends an assignment to the driver, and provides a tracking/chat interface. It also models delay detection, rerouting suggestions, and replacement attempts. AI features and road-traffic ETA calls are optional. There is **no working hospital dispatch webhook**.
 
-<p>
-  <a href="#-architecture">Architecture</a> •
-  <a href="#-features">Features</a> •
-  <a href="#-tech-stack">Tech Stack</a> •
-  <a href="#-getting-started">Getting Started</a> •
-  <a href="#-api-reference">API Reference</a> •
-  <a href="#-deployment">Deployment</a>
-</p>
+## Read this first: the actual architecture
 
-</div>
-
----
-
-## The Problem
-
-In India, **~50% of accident victims die due to delayed medical response**. The existing emergency infrastructure has no real-time tracking, no communication channel between patients and drivers, and no intelligent fallback when an ambulance is stuck. Every minute of delay increases mortality risk significantly.
-
-RapidAid solves this by building a production-grade dispatch engine that assigns ambulances in **under 300ms**, tracks them live via WebSockets, and automatically detects and handles delays through a 4-level fallback system powered by AI.
-
----
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                          CLIENT LAYER                               │
-│   React + Vite (Patient App)          React + Vite (Driver App)     │
-│   Mapbox GL JS · Socket.io Client     Socket.io Client · Location   │
-└────────────────────────┬──────────────────────┬─────────────────────┘
-                         │  HTTPS / WSS          │
-┌────────────────────────▼──────────────────────▼─────────────────────┐
-│                        API GATEWAY (Nginx)                          │
-│              Load Balancing · SSL Termination · Rate Limiting        │
-└────────────────────────────────────┬────────────────────────────────┘
-                                     │
-┌────────────────────────────────────▼────────────────────────────────┐
-│                     STATELESS NODE.js CLUSTER                       │
-│                                                                     │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────────┐  │
-│  │ Auth Service │  │  Emergency   │  │    Socket.io Server      │  │
-│  │ JWT · bcrypt │  │  Controller  │  │   Redis Adapter (rooms)  │  │
-│  └──────────────┘  └──────┬───────┘  └──────────────────────────┘  │
-│                           │                                         │
-│  ┌──────────────┐  ┌──────▼───────┐  ┌──────────────────────────┐  │
-│  │  Assignment  │  │    Delay     │  │       AI Service         │  │
-│  │  Algorithm   │  │  Detection   │  │   Groq LLaMA 3 · Triage  │  │
-│  │  <300ms SLA  │  │  Bull Worker │  │   Hospital Selection     │  │
-│  └──────┬───────┘  └──────────────┘  └──────────────────────────┘  │
-└─────────┼───────────────────────────────────────────────────────────┘
-          │
-┌─────────▼───────────────────────────────────────────────────────────┐
-│                          DATA LAYER                                 │
-│                                                                     │
-│   ┌─────────────────┐          ┌──────────────────────────────┐    │
-│   │   MongoDB Atlas  │          │        Redis (Upstash)       │    │
-│   │                  │          │                              │    │
-│   │  EmergencySession│          │  ambulance:{id}:status       │    │
-│   │  User            │          │  ambulance:{id}:location     │    │
-│   │  Ambulance       │          │  session:{id}:eta            │    │
-│   │  Hospital        │          │  session:{id}:expectedEta    │    │
-│   │  ChatMessage     │          │  TTL: 2 hours per key        │    │
-│   └─────────────────┘          └──────────────────────────────┘    │
-└─────────────────────────────────────────────────────────────────────┘
+```text
+Patient React UI                  Driver React UI
+    | HTTP /api/v1                    | HTTP + Socket.IO location_update
+    +------------+--------------------+
+                 |
+           Express API (app.js) -------- Socket.IO (emergencyRoom.js)
+                 |                           |
+       emergencyController.js          session:ID / driver:ID rooms
+                 |                           |
+            MongoDB                    Redis pub/sub adapter
+       Users / Sessions /                     |
+       Ambulances / Hospitals                 |
+                 |                           |
+       BullMQ emergency-dispatch <----------- Redis
+       Queue + Worker                 availability, geo index,
+                 |                   location TTL, ETA, reservations
+       assignmentService.js
+                 |
+      Redis GEOSEARCH -> estimated road ETA (Maps or 30 km/h fallback)
+                 |
+       Redis Lua reservation + conditional Mongo writes
+                 |
+        ambulance_assigned + driver_assignment socket events
+                 |
+       BullMQ delay-detection -> fallbackService.js
 ```
 
-### Emergency Session State Machine
+**Where to start reading:** `frontend/src/components/features/emergency/TriggerModal.jsx` → `frontend/src/store/sessionStore.js` → `backend/src/routes/emergencyRoutes.js` → `backend/src/controllers/emergencyController.js` → `backend/src/services/dispatchQueue.js` → `backend/src/workers/dispatch.worker.js` → `backend/src/services/assignmentService.js` → `backend/src/services/ambulanceCache.js` → `backend/src/sockets/emergencyRoom.js`.
 
-Every emergency is modeled as a **session** with explicit state transitions. Every transition is persisted to an event log — enabling auditing, analytics, and future ML training data.
+### What happens when a patient presses SOS
 
-```
-  ┌───────────┐    assign     ┌───────────┐    driver moves   ┌──────────┐
-  │ INITIATED │ ────────────► │ ASSIGNED  │ ───────────────►  │ EN_ROUTE │
-  └───────────┘               └───────────┘                   └────┬─────┘
-                                                                    │
-                                                    drift > 3 min   │
-                                                    ┌───────────────▼──┐
-                                                    │    DELAYED       │
-                                                    │  fallback fires  │
-                                                    └───────────────┬──┘
-                                                                    │
-                                                    ┌───────────────▼──┐
-                                                    │    RESOLVED      │
-                                                    └──────────────────┘
-```
+1. `POST /api/v1/emergency/trigger` authenticates the patient and validates coordinates/emergency type.
+2. The API creates an `INITIATED` `EmergencySession` in MongoDB. A partial unique index prevents a patient from having multiple simultaneously active sessions.
+3. It registers a recurring BullMQ dispatch job **before** returning HTTP 201. **201 means SOS recorded/queued, not ambulance assigned.** If registration fails, the controller attempts to remove the newly created session.
+4. The worker periodically reads pending sessions, searches nearby eligible ambulances via Redis `GEOSEARCH`, asks for ETAs (Google Maps when configured, otherwise a distance/speed estimate), and ranks candidates.
+5. A Redis Lua script temporarily claims an available online ambulance; conditional MongoDB updates attempt to commit its assignment and transition the session to `ASSIGNED`. Redis and MongoDB are **not a single distributed transaction**. Partial-write and crash scenarios require reconciliation.
+6. The server emits `ambulance_assigned` to `session:<id>` and `driver_assignment` to `driver:<userId>`. **Socket events are notifications**, not permanent records. Clients should re-fetch session state after reconnecting.
+7. The driver begins the trip (`EN_ROUTE`) and sends GPS; location, online eligibility and ETA are cached in Redis, and location may also be persisted to MongoDB.
+8. The delay BullMQ worker checks for ETA drift or lack of movement; fallback can suggest a navigation refresh, attempt a replacement ambulance, or send an informational AI message.
 
-### Delay Detection & Fallback
+### Ownership of state
 
-```
-Bull Worker (every 60s per session)
-       │
-       ▼
-  Compare live ETA vs expected ETA
-       │
-   drift > 3 min?
-       │
-       ├── Level 1 ──► Reroute current ambulance (Maps API alternatives)
-       │
-       ├── Level 2 ──► Swap to closer available ambulance (if ETA gain > 2 min)
-       │
-       ├── Level 3 ──► AI generates plain-language alternative for patient
-       │
-       └── Level 4 ──► Notify hospital emergency desk via webhook
-```
-
----
-
-## Features
-
-### Core Engine
-- **Sub-300ms ambulance assignment** — Redis O(1) availability reads + weighted scoring (distance 50%, ETA 30%, workload 20%)
-- **Real-time GPS tracking** — Socket.io rooms per session, location updates every 4s with delta compression (broadcasts only if moved >10m)
-- **Proactive delay detection** — background Bull worker comparing live vs expected ETA continuously
-- **4-level fallback orchestration** — reroute → swap → AI suggestion → hospital webhook
-
-### AI Layer (Groq LLaMA 3)
-- **Severity triage** — classifies emergency 1–5 from natural language description, returns structured JSON
-- **Intelligent hospital selection** — weighs severity + distance + specialization + bed availability + time of day
-- **Contextual fallback suggestions** — not hardcoded, generated per session context
-- **First-aid auto-delivery** — severity 4–5 triggers immediate first-aid instructions to patient via chat
-- **Driver quick-replies** — AI suggests 3 responses per patient message so the driver doesn't type while driving
-
-### Infrastructure
-- **Horizontally scalable** — stateless backend with Socket.io Redis adapter; any instance handles any request
-- **Geo-partitioned assignment** — city zones reduce ambulance search space by ~90% under load
-- **Full observability** — Winston structured logging, event log on every state transition, operational metrics
-- **Graceful degradation** — WebSocket disconnect preserves last known location in Redis for 5 minutes
-
----
-
-## Tech Stack
-
-| Layer | Technology | Reason |
+| Responsibility | Store | Example |
 |---|---|---|
-| **Backend** | Node.js 18 + Express 4 | Non-blocking I/O handles WebSocket + REST under high concurrency |
-| **Real-time** | Socket.io 4 | Rooms per session; Redis adapter enables horizontal scaling |
-| **Primary DB** | MongoDB Atlas | Flexible document schema for emergency sessions + GeoJSON support |
-| **State Cache** | Redis (Upstash) | O(1) ambulance availability reads; shared state across instances |
-| **Job Queue** | Bull | Redis-backed background workers for delay detection |
-| **AI** | Groq API (LLaMA 3.3 70B) | Fast inference (<300ms) for real-time triage decisions |
-| **Maps** | Google Maps Platform | Real ETA with traffic, route alternatives, geocoding |
-| **Auth** | JWT + bcrypt | Stateless access (15m) + refresh (7d) token pattern |
-| **Validation** | express-validator | Schema validation on all incoming request bodies |
-| **Logging** | Winston | Structured JSON logs; level-gated by environment |
-| **Frontend** | React 18 + Vite | Fast HMR in dev; optimized production bundle |
-| **Maps UI** | Mapbox GL JS | Smooth real-time marker updates without full re-renders |
-| **Deployment** | Railway + Vercel | Zero-config deploys; environment variable injection |
+| Durable user/driver identity and hashed refresh-token state | MongoDB `User` | role, password hash |
+| Durable emergency lifecycle, owner, assigned ambulance and audit events | MongoDB `EmergencySession` | `INITIATED`, `ASSIGNED`, `EN_ROUTE`, `DELAYED`, `RESOLVED`, `CANCELLED` |
+| Durable ambulance status, driver and last known GPS | MongoDB `Ambulance` | `assignedSessionId`, `currentLocation` |
+| Fleet spatial lookup, online availability, short-lived GPS/ETA and reservation leases | Redis | `ambulance:positions`, `ambulance:available`, `ambulance:<id>:location` |
+| Persisted dispatch and delay jobs | BullMQ on Redis | `emergency-dispatch`, `delay-detection` |
+| WebSocket room fan-out | Socket.IO + Redis adapter | `session:<id>`, `driver:<id>` |
 
----
+The database session is the durable record; live Redis values are an optimization and must be reconciled after interruptions. **Do not infer production safety from one successful demo.**
 
-## Project Structure
+### Assignment decisions and limitations
 
-```
-rapidaid/
-│
-├── backend/
-│   ├── src/
-│   │   │
-│   │   ├── config/
-│   │   │   ├── db.js                  # Mongoose connection with retry logic
-│   │   │   ├── redis.js               # ioredis client with reconnect strategy
-│   │   │   └── bullmq.js              # BullMQ queue configuration
-│   │   │
-│   │   ├── models/
-│   │   │   ├── User.js                # User schema (bcrypt pre-save hook)
-│   │   │   ├── EmergencySession.js    # Session schema + eventLog + state enum
-│   │   │   ├── Ambulance.js           # GeoJSON location + availability state
-│   │   │   └── Hospital.js            # Capacity, specializations, GeoJSON
-│   │   │
-│   │   ├── routes/
-│   │   │   ├── authRoutes.js          # POST /register, /login
-│   │   │   ├── emergencyRoutes.js     # POST /trigger, GET /:id, PATCH /:id/status
-│   │   │   ├── ambulanceRoutes.js     # CRUD + availability + location update
-│   │   │   ├── hospitalRoutes.js      # CRUD + bed availability update
-│   │   │   └── analyticsRoutes.js     # Admin dashboard analytics
-│   │   │
-│   │   ├── controllers/
-│   │   │   ├── authController.js      # Register, login, token refresh logic
-│   │   │   ├── emergencyController.js # Trigger flow, session fetch, status patch
-│   │   │   ├── ambulanceController.js # Availability management, location ping
-│   │   │   └── analyticsController.js # Dashboard metrics logic
-│   │   │
-│   │   ├── services/
-│   │   │   ├── ambulanceCache.js      # Redis cache for ambulance locations
-│   │   │   ├── assignmentService.js   # Weighted ambulance scoring algorithm
-│   │   │   ├── fallbackService.js     # 4-level fallback orchestration
-│   │   │   ├── mapsService.js         # Google Maps ETA, routing, geocoding
-│   │   │   └── ai/                    # Groq API + LangChain logic
-│   │   │       ├── triageService.js       # AI severity classification
-│   │   │       ├── firstAidService.js     # Contextual first-aid generation
-│   │   │       ├── hospitalService.js     # AI hospital matching
-│   │   │       └── driverAssistService.js # AI driver quick-replies
-│   │   │
-│   │   ├── workers/
-│   │   │   ├── delayDetection.worker.js  # BullMQ job — runs every 60s per active session
-│   │   │   └── mapsQueue.worker.js       # BullMQ job for async maps operations
-│   │   │
-│   │   ├── sockets/
-│   │   │   └── emergencyRoom.js       # Socket.io init + Redis adapter + Room logic
-│   │   │
-│   │   ├── middleware/
-│   │   │   ├── auth.js                # JWT verify + req.user injection
-│   │   │   ├── validate.js            # Request schema validation
-│   │   │   ├── requestLogger.js       # Request logging
-│   │   │   └── emergencyValidation.js # Validation for emergency endpoints
-│   │   │
-│   │   ├── utils/
-│   │   │   ├── logger.js              # Winston logger (debug in dev, info in prod)
-│   │   │   ├── AppError.js            # Custom error class with statusCode
-│   │   │   └── redis.js               # Redis utilities
-│   │   │
-│   │   ├── app.js                     # Express setup — middleware stack, routes
-│   │   └── server.js                  # HTTP server + Socket.io + connectDB entry
-│   │
-│   ├── .env.example
-│   ├── .gitignore
-│   └── package.json
-│
-└── frontend/
-    ├── src/
-    │   ├── components/
-    │   │   ├── features/              # Feature-specific components
-    │   │   │   ├── chat/ChatPanel.jsx
-    │   │   │   ├── driver/LocationEmitter.jsx
-    │   │   │   └── emergency/TriggerModal.jsx
-    │   │   ├── layout/                # App shell (Navbar, Routes)
-    │   │   │   ├── Navbar.jsx
-    │   │   │   ├── ProtectedRoute.jsx
-    │   │   │   └── RoleRoute.jsx
-    │   │   ├── map/                   # Map components
-    │   │   │   └── TrackingMap.jsx
-    │   │   └── ui/                    # Reusable generic UI components
-    │   │       ├── Badge.jsx, Button.jsx, Card.jsx, Modal.jsx, etc.
-    │   │
-    │   ├── hooks/
-    │   │   ├── useAuth.js             # Authentication hook
-    │   │   ├── useGeolocation.js      # Browser geolocation with error handling
-    │   │   └── useSocket.js           # Socket.io connection lifecycle
-    │   │
-    │   ├── pages/                     # Main page views
-    │   │   ├── Landing.jsx, Login.jsx, Register.jsx
-    │   │   ├── PatientDashboard.jsx, DriverDashboard.jsx
-    │   │   ├── AdminDashboard.jsx, EmergencyTracking.jsx
-    │   │
-    │   ├── services/
-    │   │   ├── api.js                 # Axios instance with interceptors
-    │   │   └── socket.js              # Socket.io client configuration
-    │   │
-    │   ├── store/                     # Zustand global state
-    │   │   ├── authStore.js
-    │   │   ├── driverStore.js
-    │   │   └── sessionStore.js
-    │   │
-    │   ├── utils/
-    │   │   ├── geo.js                 # Geo utilities
-    │   │   ├── jwt.js                 # Token utilities
-    │   │   └── time.js                # Time formatting
-    │   │
-    │   ├── App.jsx
-    │   ├── main.jsx
-    │   └── index.css
-    │
-    ├── .env.example
-    └── package.json
+- Only drivers reported online **and** ambulances reported available with recently refreshed GPS should enter scoring. Redis GEOSEARCH uses a 15 km radius then expands to 30 km if the first search returns none.
+- The current score weights ETA (50%), straight-line distance (30%), and reported ping age (20%), normalized by hardcoded scale factors. It is a heuristic, not a proven optimal dispatch policy.
+- The ranking uses a subset of geographically nearest candidates. Road-network ETA can make a farther ambulance faster; this is a known design trade-off.
+- Google Maps values can fall back to Haversine distance at an assumed 30 km/h. Those are estimates, **not guaranteed arrival times**.
+- The design has multiple race-sensitive paths: cancellation versus assignment, replacement versus original driver movement, and Redis versus MongoDB failure. PR #32 adds a reconciliation worker; verify its merge and run fault-injection tests before treating the recovery claim as verified.
+- No verified sub-300 ms SLA exists. The HTTP SOS acknowledgment, ambulance selection, external Maps response and Socket.IO notification are **different latency measurements**.
+
+## Project layout
+
+```text
+backend/
+  app.js                         Express middleware, REST routes, health and metrics
+  server.js                      MongoDB connection, Redis sync, HTTP/Socket.IO startup, recovery
+  src/models/                    User, Ambulance, Hospital, EmergencySession
+  src/routes/                    Auth, ambulances, emergency, hospitals, analytics
+  src/controllers/               HTTP request handlers
+  src/services/
+    ambulanceCache.js            Redis fleet eligibility / GEOSEARCH / GPS cache
+    assignmentService.js         Candidate scoring and conditional ambulance assignment
+    dispatchQueue.js             Durable dispatch scheduler and pending-session recovery
+    fallbackService.js           Delay response and replacement attempts
+    mapsService.js               Google Maps ETA with 30 km/h estimate fallback
+    metrics.js                   HTTP metrics exported in Prometheus text format
+    ai/                          Optional triage, first aid, hospital ranking, driver reply helpers
+  src/workers/
+    dispatch.worker.js           BullMQ dispatch + asynchronous assistance jobs
+    delayDetection.worker.js     BullMQ delay checks
+    mapsQueue.worker.js          Legacy/auxiliary queue (not core dispatch path)
+  src/sockets/emergencyRoom.js   JWT socket auth, rooms, GPS events and ETA updates
+  src/__tests__/                 Jest/Supertest integration and concurrent assignment tests
+frontend/src/
+  pages/                         PatientDashboard, DriverDashboard, EmergencyTracking
+  store/                         Zustand auth, driver and session stores
+  services/                      Axios client and Socket.IO client
+  components/                    Tracking map, emergency trigger, driver actions and chat
+infra/observability/             Local Prometheus, Grafana datasource, example alert rules
 ```
 
----
+## Run locally
 
-## Getting Started
-
-### Prerequisites
-
-- Node.js 18+
-- MongoDB Atlas account (free tier works)
-- Upstash Redis account (free tier works)
-- Google Maps API key (enable Maps JavaScript API + Directions API + Geocoding API)
-- Groq API key
-
-### 1. Clone the repository
+**Requirements:** Node.js 22, npm, MongoDB and Redis. Google Maps and Groq are optional; without them the project uses fallback behavior. You need local backend/frontend environment files. Real browser GPS and two-device testing require HTTPS or localhost/secure origin.
 
 ```bash
-git clone https://github.com/SHUBHANSHU602/rapidaid.git
-cd rapidaid
+git clone https://github.com/SHUBHANSHU602/RapidAid.git
+cd RapidAid/backend
+npm ci
+cp .env.example .env
 ```
 
-### 2. Backend setup
+Configure `backend/.env` with:
+
+```dotenv
+NODE_ENV=development
+PORT=5000
+MONGO_URI=mongodb://127.0.0.1:27017/rapidaid_local
+REDIS_URL=redis://127.0.0.1:6379
+JWT_SECRET=<random-long-secret>
+JWT_REFRESH_SECRET=<different-random-long-secret>
+CLIENT_URL=http://localhost:5173
+DEMO_MODE=false
+GOOGLE_MAPS_API_KEY=
+GROQ_API_KEY=
+METRICS_TOKEN=<random-private-metrics-secret>
+```
+
+Do not commit real credentials. Create unique secrets, e.g. `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`.
+
+```bash
+# Terminal A, from backend/
+npm run dev
+
+# Terminal B, from RapidAid/frontend/
+npm ci
+```
+
+Create `frontend/.env.local`:
+
+```dotenv
+VITE_API_URL=http://localhost:5000
+VITE_SOCKET_URL=http://localhost:5000
+```
+
+```bash
+npm run dev
+```
+
+Open `http://localhost:5173`. `GET http://localhost:5000/api/v1/health` reports Mongo/Redis connection status; `/internal/live` is liveness and `/internal/ready` checks dependencies.
+
+### Accounts and data
+
+- Public registration creates **patient `USER`** accounts, never `ADMIN` or `DRIVER`.
+- An existing admin provisions drivers using `POST /api/v1/auth/drivers`. A driver can provision an ambulance through `POST /api/v1/ambulances/me/provision`.
+- **Never run the seed script on a shared/production database.** It intentionally deletes some accounts/ambulances/hospitals and requires `ALLOW_DEMO_SEED=true` plus an accepted local/test/demo Mongo URI. Demo credentials are for isolated development only.
+- The app is not an emergency-service integration: seeded hospital information and simulated driver locations are not verified live providers.
+
+## REST API (prefix `/api/v1`)
+
+| Method | Route | Meaning |
+|---|---|---|
+| POST | `/auth/register` | Register patient |
+| POST | `/auth/login` | Access + refresh tokens |
+| POST | `/auth/refresh-token` | Rotate refresh token |
+| POST | `/auth/logout` | Revoke refresh token (authenticated) |
+| GET | `/auth/me` | Current user |
+| POST | `/auth/drivers` | Admin-only driver provisioning |
+| POST | `/emergency/trigger` | Persist/queue an SOS (201 != assigned) |
+| GET | `/emergency/:id` | Authorized session snapshot |
+| GET | `/emergency` | Visible sessions, role-scoped |
+| POST | `/emergency/:id/transition` | Authorized lifecycle transition |
+| POST | `/emergency/:id/cancel` | Cancel emergency |
+| POST | `/emergency/:id/arrive` | Driver arrival confirmation |
+| POST | `/emergency/:id/generate-otp` | Restricted arrival OTP generation |
+| POST / GET | `/emergency/:id/chat` | Authorized chat messages |
+| POST | `/emergency/:id/get-route` | Route for assigned driver |
+| POST | `/emergency/:id/driver-replies` | Optional driver AI replies |
+| GET | `/ambulances/me` | Driver's ambulance |
+| POST | `/ambulances/me/provision` | Driver ambulance setup/online |
+| GET | `/ambulances/me/active-session` | Recover driver's assignment |
+| PATCH | `/ambulances/:id/status` | Status endpoint |
+| GET | `/hospitals` | Active hospital records |
+| GET | `/analytics/overview` | Admin analytics |
+
+See `backend/src/routes/` for the complete route list and the controllers for payload/permission rules. The frontend Axios client prefixes routes with `/api/v1`; **do not prefix that twice** when configuring `VITE_API_URL`.
+
+**Example SOS request** (with a legitimate patient JWT):
+
+```bash
+curl -X POST http://localhost:5000/api/v1/emergency/trigger \
+  -H "Authorization: Bearer YOUR_ACCESS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"lat":25.3176,"lng":82.9739,"emergencyType":"ACCIDENT","severityLevel":3,"description":"Demo request"}'
+```
+
+Expected response: 201 with an emergency `sessionId`, initial `INITIATED` status and general information. Assignment happens asynchronously.
+
+### Socket.IO contract
+
+The Socket.IO server authenticates JWTs during handshake. Typical client events: `join_session`, `join_as_driver`, `location_update`. Server events include `ambulance_assigned`, `driver_assignment`, `driver_location`, `eta_update`, `session_status_changed`, `delay_cleared`, `ambulance_swapped`. See `frontend/src/hooks/useSocket.js` and `backend/src/sockets/emergencyRoom.js` for exact payloads. Reconnect and room rejoin are important to test.
+
+## Test and inspect
 
 ```bash
 cd backend
-npm install
-cp .env.example .env
-```
-
-Fill in your `.env`:
-
-```env
-# Server
-PORT=5000
-NODE_ENV=development
-
-# Database
-MONGODB_URI=mongodb+srv://<user>:<password>@cluster.mongodb.net/rapidaid
-
-# Redis
-REDIS_URL=rediss://<upstash-url>
-
-# Auth
-JWT_SECRET=your_jwt_secret_minimum_32_characters
-JWT_REFRESH_SECRET=your_refresh_secret_minimum_32_characters
-JWT_EXPIRES_IN=15m
-JWT_REFRESH_EXPIRES_IN=7d
-
-# AI
-GROQ_API_KEY=your_groq_api_key
-
-# Maps
-MAPS_API_KEY=your_google_maps_api_key
-
-# Client
-CLIENT_URL=http://localhost:5173
-```
-
-```bash
-npm run dev
-```
-
-Server starts on `http://localhost:5000`. Verify: `GET /health` returns `{ "status": "ok" }`.
-
-### 3. Frontend setup
-
-```bash
+npm ci
+NODE_ENV=test MONGO_URI=mongodb://127.0.0.1:27017/rapidaid_test REDIS_URL=redis://127.0.0.1:6379 npm test
 cd ../frontend
-npm install
-cp .env.example .env
+npm ci
+npm run build
 ```
 
-```env
-VITE_API_URL=http://localhost:5000
-VITE_MAPBOX_TOKEN=your_mapbox_public_token
-```
+Tests require a dedicated Mongo database and Redis instance. Set JWT secrets as in `.github/workflows/demo-ready-ci.yml`. Existing CI covers auth, sessions, optional AI fallback and competing ambulance assignment. It **does not** establish complete failure safety, real-world GPS behavior or performance SLAs. See `DEMO_GUIDE.md` for an operator-friendly walkthrough.
 
-```bash
-npm run dev
-```
+**Never run `npm run benchmark` on shared data.** The benchmark is intended for an isolated fixture environment, requires `ALLOW_BENCHMARK=true`, and reports only diagnostic results with a small sample. See its source and PR #33.
 
-Frontend starts on `http://localhost:5173`.
+## Monitoring and operational work
 
----
+- `GET /internal/live`: process liveness.
+- `GET /internal/ready`: checks MongoDB and Redis availability.
+- `GET /internal/metrics`: requires `Authorization: Bearer <METRICS_TOKEN>`; per-process HTTP counters, latency histograms and memory/uptime gauges.
+- `infra/observability/`: local Prometheus and Grafana configuration and example alert rules. Start with `infra/observability/README.md`. Rules do **not** send notifications without Alertmanager and routing configuration.
+- Logs use request correlation IDs and structured events. The provided metrics do not yet measure every business SLI (dispatch outcomes, swap recovery or queue age).
 
-## API Reference
+## What is implemented vs. what is **not** proven
 
-### Auth
-
-| Method | Endpoint | Auth | Description |
-|---|---|---|---|
-| `POST` | `/api/auth/register` | ✗ | Register new user |
-| `POST` | `/api/auth/login` | ✗ | Login, returns access + refresh tokens |
-| `POST` | `/api/auth/refresh` | ✗ | Refresh access token |
-| `POST` | `/api/auth/logout` | ✓ | Invalidate refresh token |
-
-### Emergency
-
-| Method | Endpoint | Auth | Description |
-|---|---|---|---|
-| `POST` | `/api/emergency/trigger` | USER | Trigger emergency, starts assignment flow |
-| `GET` | `/api/emergency/:id` | USER/ADMIN | Get session by ID |
-| `PATCH` | `/api/emergency/:id/status` | DRIVER/ADMIN | Update session status |
-| `GET` | `/api/emergency/active` | ADMIN | All active sessions |
-
-### Ambulance
-
-| Method | Endpoint | Auth | Description |
-|---|---|---|---|
-| `GET` | `/api/ambulance` | ADMIN | List all ambulances |
-| `POST` | `/api/ambulance` | ADMIN | Register new ambulance |
-| `PATCH` | `/api/ambulance/:id/location` | DRIVER | Update current location |
-| `PATCH` | `/api/ambulance/:id/status` | DRIVER | Toggle availability |
-
-### WebSocket Events
-
-```
-CLIENT → SERVER
-  emergency:join         { sessionId }           Join emergency room
-  location:update        { lat, lng, sessionId } Driver location ping
-  chat:message           { sessionId, text }      Send chat message
-
-SERVER → CLIENT
-  location:broadcast     { lat, lng, timestamp }  Live driver position
-  eta:update             { eta, expectedArrival }  ETA recalculation
-  session:status         { status }               State transition
-  fallback:triggered     { level, suggestion }    Fallback activated
-  chat:message           { senderId, text, time } Incoming message
-```
-
-### Request & Response Examples
-
-**Trigger Emergency**
-```bash
-POST /api/emergency/trigger
-Authorization: Bearer <access_token>
-
-{
-  "location": { "lat": 28.6139, "lng": 77.2090 },
-  "emergencyType": "cardiac",
-  "description": "Old man collapsed, not breathing, turning blue"
-}
-```
-
-```json
-{
-  "success": true,
-  "data": {
-    "sessionId": "64f8a2...",
-    "status": "ASSIGNED",
-    "ambulance": {
-      "id": "64f7b1...",
-      "driverName": "Rajesh Kumar",
-      "licensePlate": "DL 01 AB 1234",
-      "currentLocation": { "lat": 28.6121, "lng": 77.2075 },
-      "eta": 420000
-    },
-    "hospital": {
-      "name": "Apollo Hospital Dwarka",
-      "distance": "3.2 km",
-      "specialization": "Cardiac ICU"
-    },
-    "severity": 5,
-    "aiTriage": {
-      "category": "cardiac_arrest",
-      "requiresSpecialist": true,
-      "firstAidSent": true
-    }
-  }
-}
-```
-
----
-
-## Environment Variables
-
-| Variable | Required | Description |
-|---|---|---|
-| `PORT` | No | Server port (default: 5000) |
-| `NODE_ENV` | Yes | `development` or `production` |
-| `MONGODB_URI` | Yes | MongoDB Atlas connection string |
-| `REDIS_URL` | Yes | Redis connection URL |
-| `JWT_SECRET` | Yes | Min 32 chars, used for access tokens |
-| `JWT_REFRESH_SECRET` | Yes | Min 32 chars, used for refresh tokens |
-| `JWT_EXPIRES_IN` | No | Access token TTL (default: 15m) |
-| `JWT_REFRESH_EXPIRES_IN` | No | Refresh token TTL (default: 7d) |
-| `GROQ_API_KEY` | Yes | Groq API key for LLaMA inference |
-| `MAPS_API_KEY` | Yes | Google Maps Platform API key |
-| `CLIENT_URL` | Yes | Frontend origin for CORS |
-
----
-
-## Deployment
-
-### Backend → Railway
-
-```bash
-# Install Railway CLI
-npm install -g @railway/cli
-
-railway login
-railway init
-railway up
-```
-
-Set all environment variables in the Railway dashboard under **Variables**.
-
-### Frontend → Vercel
-
-```bash
-npm install -g vercel
-cd frontend
-vercel --prod
-```
-
-Set `VITE_API_URL` to your Railway backend URL in Vercel project settings.
-
-### Redis → Upstash
-
-1. Create a Redis database at [upstash.com](https://upstash.com)
-2. Copy the `REDIS_URL` (starts with `rediss://`)
-3. Paste into Railway environment variables
-
-### MongoDB → Atlas
-
-1. Create a free M0 cluster at [mongodb.com/atlas](https://mongodb.com/atlas)
-2. Create a database user and whitelist `0.0.0.0/0` for Railway's dynamic IPs
-3. Copy the connection string into `MONGODB_URI`
-
----
-
-## Key Design Decisions
-
-**Why Redis for ambulance state instead of MongoDB?**
-Ambulance location and availability are read on every assignment request and every WebSocket ping. MongoDB adds network round-trip overhead. Redis gives sub-millisecond reads in-memory. MongoDB is only written to on state change events — not every 4-second location ping.
-
-**Why Bull for delay detection instead of setInterval?**
-`setInterval` in Node.js is not reliable under load and doesn't survive process restarts. Bull persists jobs in Redis, prevents duplicate workers across multiple instances, and supports retry logic with exponential backoff.
-
-**Why stateless JWT instead of server-side sessions?**
-Sessions require sticky routing or a shared session store. JWT lets any server instance validate any request independently — critical for horizontal scaling behind a load balancer.
-
-**Why a 4-level fallback instead of one fallback action?**
-Real emergencies are not binary. Sometimes a reroute is enough. Sometimes you need to swap the ambulance entirely. Sometimes no ambulance is available at all. Layered fallback means the system always has a next action rather than failing silently.
-
----
-
-## Performance Targets
-
-| Metric | Target |
+| Claim | Current evidence / boundary |
 |---|---|
-| Ambulance assignment latency | < 300ms |
-| Location broadcast delay | < 200ms |
-| Delay detection interval | 60 seconds |
-| Delay drift threshold | 3 minutes |
-| Redis key TTL | 2 hours |
-| WebSocket reconnect window | 5 minutes |
+| SOS persisted and scheduled in BullMQ | Implemented; background jobs and restart recovery need fault testing |
+| Competing sessions cannot select the same available ambulance in the main assignment path | Dedicated concurrency test exists; other write paths (swaps, manual transitions) need adversarial tests |
+| Hospital webhook notifications | **Not implemented**; not advertised |
+| Dynamic hospital capacity | Only database values; no verified real-world live bed feed |
+| Optional Groq triage and first-aid suggestions | Model output may be inaccurate; not clinically reviewed |
+| Maps ETA | Google Maps or approximate distance/speed fallback; never a guaranteed ETA |
+| Redis/Mongo recovery | Reconciliation is proposed in PR #32; verify merge and fault-injection tests |
+| Sub-300 ms assignment / million-user scale / clinical outcomes | **Not measured or validated; do not claim** |
+| Horizontal Socket.IO fan-out | Redis adapter is configured; multi-instance driver presence and consistent scheduling require additional tests |
 
----
+## Learning route (recommended order)
 
+1. **Authentication**: `models/User.js`, `middleware/auth.js`, `controllers/authController.js`; explain JWT role and refresh-token rotation.
+2. **Persistence**: `models/EmergencySession.js`, `models/Ambulance.js`; explain indexes and session state machine.
+3. **SOS and durability**: `controllers/emergencyController.js`, `services/dispatchQueue.js`, `workers/dispatch.worker.js`; explain why acknowledgment differs from assignment.
+4. **Dispatch algorithm**: `services/ambulanceCache.js`, `services/assignmentService.js`; dry-run GEOSEARCH, scoring, Lua claim and Mongo CAS.
+5. **Consistency**: inspect PR #32 `assignmentReconciliation.js`; diagram a failure between Redis and Mongo, discuss compensation and eventual consistency.
+6. **Real-time**: `sockets/emergencyRoom.js`, `frontend/src/hooks/useSocket.js`, patient/driver pages; trace room authorization and GPS updates.
+7. **Delay/fallback**: `workers/delayDetection.worker.js` and `services/fallbackService.js`; demonstrate reroute and replacement with two test drivers.
+8. **Operations**: `metrics.js`, `requestLogger.js`, `infra/observability/` and CI; measure latency and identify when alerts would fire.
 
-
----
-
-<div align="center">
-  <p>Built by <a href="https://github.com/SHUBHANSHU602">Shubhanshu Singh</a></p>
- 
-</div>
+**Honest project description for interviews:** “RapidAid is a real-time ambulance-dispatch coordination prototype built with Node.js, MongoDB, Redis, BullMQ and Socket.IO. I implemented durable SOS queueing, indexed nearby search, conditional reservations, driver tracking and monitoring, and I can explain the limitations of cross-store consistency and live-service reliability.” Do not represent it as a clinically deployed platform.

@@ -4,7 +4,7 @@ on:
   pull_request:
     branches: [main]
   push:
-    branches: [fix/demo-ready-e2e]
+    branches: [main]
 
 jobs:
   frontend-build:
@@ -63,4 +63,7 @@ jobs:
           node --check src/sockets/emergencyRoom.js
           node --check src/workers/delayDetection.worker.js
           node --check src/controllers/ambulanceController.js
+          node --check src/services/dispatchQueue.js
+          node --check src/workers/dispatch.worker.js
+          node --check server.js
       - run: npm test
