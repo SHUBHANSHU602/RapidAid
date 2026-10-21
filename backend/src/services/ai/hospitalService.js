@@ -13,7 +13,7 @@ const logger = require('../../utils/logger');
  */
 async function selectHospital(patientLat, patientLng, triageResult, emergencyType) {
   // Fetch all active hospitals
-  const hospitals = await Hospital.find({ isActive: true }).lean();
+  const hospitals = await Hospital.find({ isActive: true, availableBeds: { $gt: 0 }, emergencyCapacity: { $gt: 0 } }).lean();
 
   if (hospitals.length === 0) {
     logger.warn('Hospital selection: no active hospitals found');
@@ -76,8 +76,18 @@ Respond ONLY with valid JSON, no markdown:
       return fallbackHospitalSelection(top5);
     }
 
-    logger.info(`Hospital selection: top pick is ${parsed.ranked[0]?.name}`);
-    return parsed.ranked;
+    const allowed = new Map(top5.map(h => [h.id, h]));
+    const seen = new Set();
+    const safe = parsed.ranked.filter(row => row && allowed.has(row.id))
+      .filter(row => { if (seen.has(row.id)) return false; seen.add(row.id); return true; })
+      .slice(0, 3).map((row, i) => ({
+        id: row.id, name: allowed.get(row.id).name,
+        reason: typeof row.reason === 'string' ? row.reason.slice(0, 250) : 'Eligible hospital',
+        rank: i + 1
+      }));
+    if (!safe.length) return fallbackHospitalSelection(top5);
+    logger.info(`Hospital selection: top pick is ${safe[0].name}`);
+    return safe;
   } catch (err) {
     logger.error('Hospital selection: Groq failed — using distance fallback', err.message);
     return fallbackHospitalSelection(top5);
