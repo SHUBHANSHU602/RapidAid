@@ -2,7 +2,7 @@ const ngeohash = require('ngeohash');
 const redis = require('../config/redis');
 const Ambulance = require('../models/Ambulance');
 const EmergencySession = require('../models/EmergencySession');
-const { getEligibleAmbulanceIds } = require('./ambulanceCache');
+const { getAvailableAmbulancesNear } = require('./ambulanceCache');
 const { haversineDistance, getETAsToDestination } = require('./mapsService');
 const logger = require('../utils/logger');
 const { getIO } = require('../sockets/emergencyRoom');
@@ -10,61 +10,12 @@ const { getIO } = require('../sockets/emergencyRoom');
 const AVAILABLE_SET_KEY = 'ambulance:available';
 
 async function getNearbyAvailableAmbulances(lat, lng, maxCandidates = 10) {
-  const target = ngeohash.encode(lat, lng, 7);
-  const neighbours = ngeohash.neighbors(target);
-  const prefixes = [target.slice(0, 5), ...Object.values(neighbours).map((n) => n.slice(0, 5))];
-  const uniquePrefixes = [...new Set(prefixes)];
-
-  const availableIds = await getEligibleAmbulanceIds();
-  if (!availableIds.length) return [];
-
-  const pipeline = redis.pipeline();
-  for (const id of availableIds) pipeline.get(`ambulance:${id}:location`);
-  const results = await pipeline.exec();
-
-  const allCandidates = [];
-  for (let i = 0; i < availableIds.length; i++) {
-    const raw = results[i]?.[1];
-    if (!raw) continue;
-
-    let location;
-    try {
-      location = JSON.parse(raw);
-    } catch {
-      continue;
-    }
-
-    const aLat = Number(location.lat ?? location.latitude);
-    const aLng = Number(location.lng ?? location.longitude);
-    if (!Number.isFinite(aLat) || !Number.isFinite(aLng)) continue;
-
-    const geohash = location.geohash || ngeohash.encode(aLat, aLng, 7);
-    allCandidates.push({
-      ambulanceId: availableIds[i],
-      lat: aLat,
-      lng: aLng,
-      geohash,
-      distanceKm: haversineDistance(lat, lng, aLat, aLng),
-    });
-  }
-
-  const localCandidates = allCandidates.filter((candidate) =>
-    uniquePrefixes.some((prefix) => candidate.geohash.startsWith(prefix))
-  );
-
-  const candidatePool = localCandidates.length
-    ? localCandidates
-    : process.env.DEMO_MODE === 'true'
-      ? allCandidates
-      : [];
-
-  if (!localCandidates.length && candidatePool.length) {
-    logger.warn(`Demo geohash fallback: considering ${candidatePool.length} online ambulance(s)`);
-  }
-
-  return candidatePool
-    .sort((a, b) => a.distanceKm - b.distanceKm)
-    .slice(0, maxCandidates);
+  // Expand the radius once when local demand exceeds the available supply.
+  const primary = await getAvailableAmbulancesNear(lat, lng, 15, 100);
+  const pool = primary.length ? primary : await getAvailableAmbulancesNear(lat, lng, 30, 150);
+  return pool.map(a => ({
+    ...a, distanceKm: haversineDistance(lat, lng, a.lat, a.lng)
+  })).sort((a, b) => a.distanceKm - b.distanceKm).slice(0, maxCandidates);
 }
 
 function scoreCandidate(etaSeconds, distanceKm, lastPingMs) {
