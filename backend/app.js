@@ -1,5 +1,6 @@
 const path = require('path');
-require('dotenv').config({ path: path.resolve(__dirname, '.env') });
+if (process.env.NODE_ENV !== 'test') require('dotenv').config({ path: path.resolve(__dirname, '.env') });
+require('./src/config/testSafety').assertTestConnections();
 
 const express = require('express');
 const helmet = require('helmet');

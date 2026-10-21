@@ -1,12 +1,13 @@
+const { lazyResource } = require('../config/resources');
 const { Queue } = require('bullmq');
 const { getBullMQConnection } = require('../config/bullmq');
 const EmergencySession = require('../models/EmergencySession');
 const logger = require('../utils/logger');
 
-const dispatchQueue = new Queue('emergency-dispatch', {
+const dispatchQueue = lazyResource(() => new Queue('emergency-dispatch', {
   connection: getBullMQConnection(),
   defaultJobOptions: { attempts: 3, backoff: { type: 'exponential', delay: 1000 }, removeOnComplete: 100, removeOnFail: 100 }
-});
+}));
 
 // A repeatable job scheduler is durable and survives the API process crashing.
 // The worker removes this scheduler immediately after successful assignment.

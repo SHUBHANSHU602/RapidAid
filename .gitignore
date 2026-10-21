@@ -4,3 +4,7 @@ node_modules/
 dist/
 # Never commit local observability credentials
 infra/observability/secrets/
+
+# Local verification output
+.local-verification/
+.docker-test/

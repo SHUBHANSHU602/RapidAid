@@ -1,4 +1,3 @@
-require('dotenv').config();
 
 // Mock Groq to simulate it being completely down
 jest.mock('../services/ai/groqService', () => ({

@@ -28,15 +28,15 @@ jobs:
       mongo:
         image: mongo:7
         ports:
-          - 27017:27017
+          - 27018:27017
       redis:
         image: redis:7-alpine
         ports:
-          - 6379:6379
+          - 6380:6379
     env:
       NODE_ENV: test
-      MONGO_URI: mongodb://127.0.0.1:27017/rapidaid_test
-      REDIS_URL: redis://127.0.0.1:6379
+      TEST_MONGO_URI: mongodb://127.0.0.1:27018/rapidaid_test_ci
+      TEST_REDIS_URL: redis://127.0.0.1:6380/15
       JWT_SECRET: ci_access_secret_please_replace
       JWT_REFRESH_SECRET: ci_refresh_secret_please_replace
       JWT_EXPIRES_IN: 15m

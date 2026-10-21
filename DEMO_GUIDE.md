@@ -2,6 +2,8 @@
 
 This guide describes an isolated two-device engineering demo, not real emergency assistance. It requires two test accounts and valid local or HTTPS geolocation.
 
+See [LOCAL_TESTING.md](LOCAL_TESTING.md) for exact startup commands. Demo ports (27019/6381) are separate from disposable Jest ports (27018/6380).
+
 ## 1. Backend configuration
 
 Copy `backend/.env.example` to `backend/.env` and configure MongoDB, Redis, JWT secrets, and the frontend origin. Google Maps and Groq are optional.

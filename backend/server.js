@@ -7,8 +7,8 @@ const logger = require('./src/utils/logger');
 const EmergencySession = require('./src/models/EmergencySession');
 const { syncAmbulancesToRedis } = require('./src/services/ambulanceCache');
 const { initSocket } = require('./src/sockets/emergencyRoom');
-require('./src/workers/mapsQueue.worker');
-const { scheduleDelayDetection } = require('./src/workers/delayDetection.worker');
+const { startMapsWorker } = require('./src/workers/mapsQueue.worker');
+const { scheduleDelayDetection, startDelayWorker } = require('./src/workers/delayDetection.worker');
 const { recoverPendingDispatches } = require('./src/services/dispatchQueue');
 const { reconcileAssignments } = require('./src/services/assignmentReconciliation');
 const { startDispatchWorker } = require('./src/workers/dispatch.worker');
@@ -71,6 +71,8 @@ async function recoverActiveDelayMonitors() {
 
 const startServer = async () => {
   await connectDB();
+  startMapsWorker();
+  startDelayWorker();
 
   try {
     const count = await syncAmbulancesToRedis();
