@@ -3,6 +3,7 @@ const mongoose = require('mongoose');
 const EmergencySession = require('../models/EmergencySession');
 const Ambulance = require('../models/Ambulance');
 const User = require('../models/User');
+const redis = require('../config/redis');
 const { assignAmbulance } = require('../services/assignmentService');
 
 async function runBenchmark() {
@@ -41,12 +42,24 @@ async function runBenchmark() {
     const session = await EmergencySession.findById(id).lean();
     if (!session) continue;
     if (session.ambulanceId) {
-      await Ambulance.updateOne({ _id: session.ambulanceId, assignedSessionId: id },
-        { $set: { status: 'AVAILABLE', assignedSessionId: null } });
+      const ambulanceId = String(session.ambulanceId);
+      const released = await Ambulance.updateOne(
+        { _id: session.ambulanceId, assignedSessionId: id },
+        { $set: { status: 'AVAILABLE', assignedSessionId: null } }
+      );
+      if (released.modifiedCount === 1) {
+        const pipeline = redis.pipeline();
+        pipeline.set(`ambulance:${ambulanceId}:status`, 'AVAILABLE');
+        pipeline.sadd('ambulance:available', ambulanceId);
+        pipeline.del(`ambulance:${ambulanceId}:reservation`);
+        pipeline.del(`session:${id}:eta`);
+        await pipeline.exec();
+      }
     }
     await EmergencySession.deleteOne({ _id: id });
   }
   await User.deleteMany({ _id: { $in: testUsers } });
+  await redis.quit();
   await mongoose.disconnect();
 }
 runBenchmark().catch(err => { console.error(err.message); process.exitCode = 1; });
