@@ -27,7 +27,8 @@ const userSchema = new mongoose.Schema(
       type: String,
       enum: ['USER', 'DRIVER', 'ADMIN'],
       default: 'USER'
-    }
+    },
+    refreshTokenHash: { type: String, select: false }
   },
   {
     timestamps: true

@@ -112,3 +112,27 @@ describe('Privilege boundaries', () => {
     }
   });
 });
+
+describe('Refresh token rotation and revocation', () => {
+  test('rejects replayed refresh token and revoked token after logout', async () => {
+    const email = 'testauthrefreshreplay@test.com';
+    await User.deleteOne({ email });
+    const signup = await request(app).post('/api/v1/auth/register')
+      .send({ name: 'Refresh User', email, password: 'test123' });
+    expect(signup.status).toBe(201);
+    const rotated = await request(app).post('/api/v1/auth/refresh-token')
+      .send({ refreshToken: signup.body.refreshToken });
+    expect(rotated.status).toBe(200);
+    expect(rotated.body.refreshToken).not.toBe(signup.body.refreshToken);
+    const replay = await request(app).post('/api/v1/auth/refresh-token')
+      .send({ refreshToken: signup.body.refreshToken });
+    expect(replay.status).toBe(401);
+    const logout = await request(app).post('/api/v1/auth/logout')
+      .set('Authorization', `Bearer ${rotated.body.accessToken}`);
+    expect(logout.status).toBe(200);
+    const revoked = await request(app).post('/api/v1/auth/refresh-token')
+      .send({ refreshToken: rotated.body.refreshToken });
+    expect(revoked.status).toBe(401);
+    await User.deleteOne({ email });
+  });
+});
