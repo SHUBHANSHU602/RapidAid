@@ -126,13 +126,14 @@ async function assignAmbulance(sessionId, patientLat, patientLng) {
   const scored = top5.map((candidate, index) => {
     const doc = docMap[candidate.ambulanceId];
     const lastPingMs = doc?.lastPing ? new Date(doc.lastPing).getTime() : 0;
-    const candidateEta = Number(etaSeconds[index]) || 0;
+    const candidateEta = Number(etaSeconds[index]);
+    if (!Number.isFinite(candidateEta) || candidateEta <= 0) return null;
     return {
       ...candidate,
       etaSeconds: candidateEta,
       score: scoreCandidate(candidateEta, candidate.distanceKm, lastPingMs),
     };
-  }).sort((a, b) => a.score - b.score);
+  }).filter(Boolean).sort((a, b) => a.score - b.score);
 
   let best = null;
   for (const candidate of scored) {
