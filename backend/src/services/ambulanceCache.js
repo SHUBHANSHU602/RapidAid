@@ -4,6 +4,8 @@ const ngeohash = require('ngeohash');
 
 const AVAILABLE_SET_KEY = 'ambulance:available';
 const ONLINE_SET_KEY = 'ambulance:online';
+const GEO_KEY = 'ambulance:positions';
+const MAX_LOCATION_AGE_MS = Number(process.env.AMBULANCE_LOCATION_MAX_AGE_MS || 90000);
 
 function buildLocationPayload(lat, lng) {
   return {
@@ -22,6 +24,7 @@ async function syncAmbulancesToRedis() {
 
   pipeline.del(AVAILABLE_SET_KEY);
   pipeline.del(ONLINE_SET_KEY); // nobody is considered online after a backend restart until their app reconnects
+  pipeline.del(GEO_KEY);
 
   for (const amb of ambulances) {
     const id = amb._id.toString();
@@ -31,6 +34,7 @@ async function syncAmbulancesToRedis() {
     pipeline.set(`ambulance:${id}:status`, amb.status);
     pipeline.set(`ambulance:${id}:location`, JSON.stringify(location));
     pipeline.set(`ambulance:${id}:zone`, ngeohash.encode(lat, lng, 4));
+    pipeline.geoadd(GEO_KEY, lng, lat, id);
 
     if (amb.status === 'AVAILABLE') {
       pipeline.sadd(AVAILABLE_SET_KEY, id);
@@ -65,6 +69,7 @@ async function updateAmbulanceLocation(ambulanceId, lat, lng, persistToMongo = t
   pipeline.set(`ambulance:${id}:location`, JSON.stringify(location), 'EX', 300);
   pipeline.set(`ambulance:${id}:zone`, ngeohash.encode(lat, lng, 4), 'EX', 300);
   pipeline.sadd(ONLINE_SET_KEY, id);
+  pipeline.geoadd(GEO_KEY, lng, lat, id);
   await pipeline.exec();
 
   if (persistToMongo) {
@@ -86,59 +91,35 @@ async function getEligibleAmbulanceIds() {
   return availableIds.filter((id) => online.has(id));
 }
 
-async function getAvailableAmbulancesNear(lat, lng, radiusChars = 5) {
-  const queryGeohash = ngeohash.encode(lat, lng, 7);
-  const neighbours = ngeohash.neighbors(queryGeohash);
-  const prefixes = [
-    queryGeohash.slice(0, radiusChars),
-    ...Object.values(neighbours).map((hash) => hash.slice(0, radiusChars)),
-  ];
-  const uniquePrefixes = [...new Set(prefixes)];
-
-  const availableIds = await getEligibleAmbulanceIds();
-  if (availableIds.length === 0) return [];
-
+// Redis GEOSEARCH retrieves nearby IDs without scanning the entire fleet.
+// The availability set and fresh authenticated GPS remain final eligibility guards.
+async function getAvailableAmbulancesNear(lat, lng, radiusKm = 15, maxResults = 100) {
+  const eligible = new Set(await getEligibleAmbulanceIds());
+  if (!eligible.size) return [];
+  const rows = await redis.call('GEOSEARCH', GEO_KEY, 'FROMLONLAT', lng, lat,
+    'BYRADIUS', radiusKm, 'km', 'ASC', 'COUNT', maxResults);
+  if (!rows.length) return [];
+  const ids = rows.filter(id => eligible.has(id));
+  if (!ids.length) return [];
   const pipeline = redis.pipeline();
-  for (const id of availableIds) pipeline.get(`ambulance:${id}:location`);
-  const results = await pipeline.exec();
-
-  const allCandidates = [];
-  for (let i = 0; i < availableIds.length; i++) {
-    const raw = results[i]?.[1];
-    if (!raw) continue;
-
-    let location;
+  ids.forEach(id => pipeline.get(`ambulance:${id}:location`));
+  const result = await pipeline.exec();
+  const now = Date.now();
+  const candidates = [];
+  for (let i = 0; i < ids.length; i++) {
     try {
-      location = JSON.parse(raw);
-    } catch {
-      continue;
-    }
-
-    const aLat = Number(location.lat ?? location.latitude);
-    const aLng = Number(location.lng ?? location.longitude);
-    if (!Number.isFinite(aLat) || !Number.isFinite(aLng)) continue;
-
-    const geohash = location.geohash || ngeohash.encode(aLat, aLng, 7);
-    allCandidates.push({
-      ambulanceId: availableIds[i],
-      lat: aLat,
-      lng: aLng,
-      geohash,
-    });
+      const raw = result[i]?.[1];
+      if (!raw) continue;
+      const loc = JSON.parse(raw);
+      const updatedAt = Date.parse(loc.updatedAt);
+      if (!Number.isFinite(updatedAt) || now - updatedAt > MAX_LOCATION_AGE_MS || updatedAt > now + 10000) continue;
+      const aLat = Number(loc.lat ?? loc.latitude);
+      const aLng = Number(loc.lng ?? loc.longitude);
+      if (!Number.isFinite(aLat) || !Number.isFinite(aLng)) continue;
+      candidates.push({ ambulanceId: ids[i], lat: aLat, lng: aLng, updatedAt: loc.updatedAt, geohash: loc.geohash });
+    } catch { /* Discard corrupt or stale position data. */ }
   }
-
-  const nearby = allCandidates.filter((candidate) =>
-    uniquePrefixes.some((prefix) => candidate.geohash.startsWith(prefix))
-  );
-
-  // Keep the geohash boundary for normal operation. In demo mode, if browser GPS
-  // puts the second driver just outside the current bucket, still consider the
-  // actually-online replacement rather than making the swap impossible.
-  if (!nearby.length && process.env.DEMO_MODE === 'true' && allCandidates.length) {
-    return allCandidates;
-  }
-
-  return nearby;
+  return candidates;
 }
 
 async function getAmbulanceStatus(ambulanceId) {
