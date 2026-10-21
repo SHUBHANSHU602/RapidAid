@@ -22,6 +22,12 @@ const createServiceArea = (lat, lng, size = 0.05) => ({
 });
 
 const seedDatabase = async () => {
+  if (process.env.NODE_ENV === 'production' || process.env.ALLOW_DEMO_SEED !== 'true') {
+    throw new Error('Demo seed disabled. Set ALLOW_DEMO_SEED=true only in an isolated development database.');
+  }
+  if (!process.env.MONGO_URI || !/(localhost|127\.0\.0\.1|_demo|_test|\/rapidaid_demo)/.test(process.env.MONGO_URI)) {
+    throw new Error('Refusing destructive seed against an unrecognized database target');
+  }
   try {
     await mongoose.connect(process.env.MONGO_URI);
     logger.info('Connected to MongoDB for seeding');
