@@ -54,14 +54,16 @@ async function reconcileAssignments() {
       if (amb.assignedSessionId || amb.status === 'BUSY' || cachedStatus === 'BUSY') {
         if (session && ACTIVE_STATUSES.has(session.status) &&
             String(session.ambulanceId) !== id) stats.inconsistent++;
+        const repairedStatus = amb.status === 'OFFLINE' ? 'OFFLINE' : 'AVAILABLE';
         const repaired = await Ambulance.updateOne(
           { _id: amb._id, assignedSessionId: amb.assignedSessionId, status: amb.status },
-          { $set: { assignedSessionId: null, status: 'AVAILABLE' } }
+          { $set: { assignedSessionId: null, status: repairedStatus } }
         );
         if (repaired.modifiedCount) {
           const pipeline = redis.pipeline();
-          pipeline.set(statusKey, 'AVAILABLE');
-          pipeline.sadd('ambulance:available', id);
+          pipeline.set(statusKey, repairedStatus);
+          if (repairedStatus === 'AVAILABLE') pipeline.sadd('ambulance:available', id);
+          else pipeline.srem('ambulance:available', id);
           await pipeline.exec();
           stats.recovered++;
         }
