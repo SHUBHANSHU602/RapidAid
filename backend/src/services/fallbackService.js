@@ -1,4 +1,3 @@
-const axios = require('axios');
 const EmergencySession = require('../models/EmergencySession');
 const Ambulance = require('../models/Ambulance');
 const { getSingleETA } = require('./mapsService');
@@ -378,30 +377,8 @@ async function fallbackLevel3and4(session, currentEta) {
     logger.error(`Fallback L3 error: ${err.message}`);
   }
 
-  try {
-    const payload = {
-      sessionId: session._id,
-      emergencyType: session.emergencyType,
-      severityLevel: session.severityLevel,
-      patientLocation: session.location,
-      ambulanceDelayed: true,
-      currentEta,
-      timestamp: new Date().toISOString(),
-    };
+  // Hospital webhook integration removed: no verified hospital receiver is configured.
 
-    if (process.env.HOSPITAL_WEBHOOK_URL) {
-      await axios.post(process.env.HOSPITAL_WEBHOOK_URL, payload, { timeout: 5000 });
-    }
-
-    const liveSession = await EmergencySession.findById(session._id);
-    liveSession.addEvent('HOSPITAL_WEBHOOK_TRIGGERED', {
-      delivered: Boolean(process.env.HOSPITAL_WEBHOOK_URL),
-      payload,
-    });
-    await liveSession.save();
-  } catch (err) {
-    logger.error(`Fallback L4 error: ${err.message}`);
-  }
 }
 
 module.exports = { triggerFallback, clearFallbackStage };
