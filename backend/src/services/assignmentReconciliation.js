@@ -21,8 +21,9 @@ async function reconcileAssignments() {
       const id = String(amb._id);
       const statusKey = `ambulance:${id}:status`;
       const reservationKey = `ambulance:${id}:reservation`;
-      const [reservedFor, cachedStatus] = await Promise.all([
-        redis.get(reservationKey), redis.get(statusKey)
+      const [reservedFor, cachedStatus, listedAvailable] = await Promise.all([
+        redis.get(reservationKey), redis.get(statusKey),
+        redis.sismember('ambulance:available', id)
       ]);
 
       const session = amb.assignedSessionId
@@ -32,7 +33,7 @@ async function reconcileAssignments() {
         && String(session.ambulanceId) === id;
 
       if (validAssignment) {
-        if (amb.status !== 'BUSY' || cachedStatus !== 'BUSY') {
+        if (amb.status !== 'BUSY' || cachedStatus !== 'BUSY' || listedAvailable === 1) {
           await Ambulance.updateOne({ _id: amb._id, assignedSessionId: amb.assignedSessionId },
             { $set: { status: 'BUSY' } });
           const pipeline = redis.pipeline();
