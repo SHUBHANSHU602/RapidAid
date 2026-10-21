@@ -2,3 +2,5 @@ node_modules/
 .env
 *.log
 dist/
+# Never commit local observability credentials
+infra/observability/secrets/
