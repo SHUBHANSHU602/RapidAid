@@ -47,12 +47,25 @@ async function syncAmbulancesToRedis() {
 
 async function updateAmbulanceStatus(ambulanceId, newStatus) {
   const id = ambulanceId.toString();
+  if (!['AVAILABLE', 'BUSY', 'OFFLINE'].includes(newStatus)) {
+    throw new Error('Invalid ambulance status');
+  }
 
-  await redis.set(`ambulance:${id}:status`, newStatus);
-  if (newStatus === 'AVAILABLE') await redis.sadd(AVAILABLE_SET_KEY, id);
-  else await redis.srem(AVAILABLE_SET_KEY, id);
+  // MongoDB is the durable assignment owner. Never publish AVAILABLE in Redis
+  // until MongoDB confirms that this ambulance has no assigned emergency.
+  const query = { _id: ambulanceId };
+  if (newStatus === 'AVAILABLE') query.assignedSessionId = null;
+  const updated = await Ambulance.findOneAndUpdate(
+    query, { $set: { status: newStatus } }, { new: true }
+  );
+  if (!updated) throw new Error('Ambulance not found or still has an assigned session');
 
-  await Ambulance.findByIdAndUpdate(ambulanceId, { status: newStatus });
+  const pipeline = redis.pipeline();
+  pipeline.set(`ambulance:${id}:status`, newStatus);
+  if (newStatus === 'AVAILABLE') pipeline.sadd(AVAILABLE_SET_KEY, id);
+  else pipeline.srem(AVAILABLE_SET_KEY, id);
+  await pipeline.exec();
+  return updated;
 }
 
 async function setAmbulanceOnline(ambulanceId, online) {
