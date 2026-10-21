@@ -125,3 +125,26 @@ describe('EmergencySession — addEvent()', () => {
     expect(entry._id).toBeUndefined();
   });
 });
+describe('Active SOS invariant under concurrency', () => {
+  test('only one concurrent active emergency may be created for a patient', async () => {
+    const userId = new mongoose.Types.ObjectId();
+    const attempts = await Promise.allSettled([
+      EmergencySession.create({ ...makeSession(), userId }),
+      EmergencySession.create({ ...makeSession(), userId }),
+    ]);
+    expect(attempts.filter(x => x.status === 'fulfilled')).toHaveLength(1);
+    expect(attempts.filter(x => x.status === 'rejected')).toHaveLength(1);
+    await EmergencySession.deleteMany({ userId });
+  });
+
+  test('one conditional lifecycle transition wins when two compete', async () => {
+    const userId = new mongoose.Types.ObjectId();
+    const session = await EmergencySession.create({ ...makeSession(), userId });
+    const contenders = await Promise.all([
+      EmergencySession.findOneAndUpdate({ _id: session._id, status: 'INITIATED' }, { $set: { status: 'CANCELLED' } }, { new: true }),
+      EmergencySession.findOneAndUpdate({ _id: session._id, status: 'INITIATED' }, { $set: { status: 'ASSIGNED' } }, { new: true })
+    ]);
+    expect(contenders.filter(Boolean)).toHaveLength(1);
+    await EmergencySession.deleteMany({ userId });
+  });
+});
