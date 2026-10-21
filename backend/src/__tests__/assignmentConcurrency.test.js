@@ -73,4 +73,14 @@ describe('Assignment: simultaneous patients competing for one ambulance', () => 
     expect(await redis.sismember('ambulance:available', id)).toBe(0);
   });
 
+  test('reconciler removes stale AVAILABLE membership even if both statuses read BUSY', async () => {
+    const id = ambulance._id.toString();
+    await redis.set(`ambulance:${id}:status`, 'BUSY');
+    await redis.sadd('ambulance:available', id);
+    await reconcileAssignments();
+    expect(await redis.get(`ambulance:${id}:status`)).toBe('BUSY');
+    expect(await redis.sismember('ambulance:available', id)).toBe(0);
+  });
+
+
 });
