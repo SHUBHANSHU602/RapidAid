@@ -1,3 +1,4 @@
+const { lazyResource } = require('../config/resources');
 const { Worker } = require('bullmq');
 const { getBullMQConnection } = require('../config/bullmq');
 const EmergencySession = require('../models/EmergencySession');
@@ -50,13 +51,15 @@ async function prepareAssistance(sessionId) {
   } catch (error) { logger.warn('assistance_socket_delivery_failed', { error: error.message }); }
 }
 
+let worker;
 function startDispatchWorker() {
-  const worker = new Worker('emergency-dispatch', async (job) => {
+  if (worker) return worker;
+  worker = lazyResource(() => new Worker('emergency-dispatch', async (job) => {
     const { sessionId } = job.data;
     if (job.name === 'assign-ambulance') return dispatch(sessionId);
     if (job.name === 'prepare-assistance') return prepareAssistance(sessionId);
     throw new Error('Unknown dispatch job: ' + job.name);
-  }, { connection: getBullMQConnection(), concurrency: 5 });
+  }, { connection: getBullMQConnection(), concurrency: 5 }));
   worker.on('failed', (job, error) => logger.error('dispatch_job_failed', {
     jobId: job?.id, error: error.message
   }));

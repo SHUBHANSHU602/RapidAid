@@ -4,6 +4,7 @@ EventEmitter.defaultMaxListeners = 50;
 const Redis = require('ioredis');
 const logger = require('../utils/logger');
 
+require('./testSafety').assertTestConnections();
 const redis = new Redis(process.env.REDIS_URL, {
   maxRetriesPerRequest: 3,
   retryStrategy(times) {

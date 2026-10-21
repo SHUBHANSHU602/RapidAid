@@ -103,7 +103,7 @@ infra/observability/             Local Prometheus, Grafana datasource, example a
 
 ## Run locally
 
-**Requirements:** Node.js 22, npm, MongoDB and Redis. Google Maps and Groq are optional; without them the project uses fallback behavior. You need local backend/frontend environment files. Real browser GPS and two-device testing require HTTPS or localhost/secure origin.
+**Requirements:** Node.js 22 or 24, npm, Docker Desktop (or dedicated MongoDB and Redis). Start `docker compose -f compose.local.yml up -d` from the repository root. Google Maps and Groq are optional; without them the project uses fallback behavior. You need local backend/frontend environment files. Real browser GPS and two-device testing require HTTPS or localhost/secure origin.
 
 ```bash
 git clone https://github.com/SHUBHANSHU602/RapidAid.git
@@ -117,8 +117,8 @@ Configure `backend/.env` with:
 ```dotenv
 NODE_ENV=development
 PORT=5000
-MONGO_URI=mongodb://127.0.0.1:27017/rapidaid_local
-REDIS_URL=redis://127.0.0.1:6379
+MONGO_URI=mongodb://127.0.0.1:27019/rapidaid_demo
+REDIS_URL=redis://127.0.0.1:6381/0
 JWT_SECRET=<random-long-secret>
 JWT_REFRESH_SECRET=<different-random-long-secret>
 CLIENT_URL=http://localhost:5173
@@ -204,18 +204,22 @@ The Socket.IO server authenticates JWTs during handshake. Typical client events:
 
 ## Test and inspect
 
+See [LOCAL_TESTING.md](LOCAL_TESTING.md) for PowerShell commands, disposable test services, environment guards, audit results and the patient/driver checklist.
+
 ```bash
+# Repository root; Docker Desktop must be running.
+docker compose -f compose.test.yml up -d --wait
 cd backend
 npm ci
-NODE_ENV=test MONGO_URI=mongodb://127.0.0.1:27017/rapidaid_test REDIS_URL=redis://127.0.0.1:6379 npm test
+npm test
 cd ../frontend
 npm ci
 npm run build
 ```
 
-Tests require a dedicated Mongo database and Redis instance. Set JWT secrets as in `.github/workflows/demo-ready-ci.yml`. Existing CI covers auth, sessions, optional AI fallback and competing ambulance assignment. It **does not** establish complete failure safety, real-world GPS behavior or performance SLAs. See `DEMO_GUIDE.md` for an operator-friendly walkthrough.
+Jest ignores backend/.env, forces NODE_ENV=test, uses MongoDB port 27018 with a rapidaid_test_ database and Redis port 6380/database 15, and refuses other hosts/ports. Tests reset only these disposable stores. Demo services use separate ports 27019/6381. Do not run concurrent Jest invocations against the same test services.
 
-**Never run `npm run benchmark` on shared data.** The benchmark is intended for an isolated fixture environment, requires `ALLOW_BENCHMARK=true`, and reports only diagnostic results with a small sample. See its source and PR #33.
+**Never run `npm run benchmark` on shared data.** Its five sequential attempts are diagnostic; failure-safe benchmark cleanup and load testing remain unverified.
 
 ## Monitoring and operational work
 

@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node server.js",
     "dev": "nodemon server.js",
-    "test": "jest --runInBand --forceExit",
+    "test": "jest --runInBand --detectOpenHandles",
     "seed": "node src/utils/seed.js",
     "benchmark": "node src/utils/benchmark.js",
     "test:socket": "node src/utils/socketTest.js"
@@ -16,7 +16,14 @@
     "testMatch": [
       "**/__tests__/**/*.test.js"
     ],
-    "testEnvironment": "node"
+    "testEnvironment": "<rootDir>/test/environment.cjs",
+    "setupFiles": [
+      "<rootDir>/test/environment.js"
+    ],
+    "setupFilesAfterEnv": [
+      "<rootDir>/test/lifecycle.js"
+    ],
+    "globalSetup": "<rootDir>/test/preflight.js"
   },
   "keywords": [],
   "author": "",
@@ -27,7 +34,6 @@
     "axios": "^1.18.1",
     "bcryptjs": "^3.0.3",
     "bottleneck": "^2.19.5",
-    "bull": "^4.16.5",
     "bullmq": "^6.2.0",
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
@@ -37,17 +43,17 @@
     "groq-sdk": "^1.5.0",
     "helmet": "^8.2.0",
     "ioredis": "^5.11.1",
-    "jest": "^30.4.2",
     "jsonwebtoken": "^9.0.3",
     "mongoose": "^9.7.0",
     "ngeohash": "^0.6.3",
     "socket.io": "^4.8.3",
     "socket.io-client": "^4.8.3",
-    "supertest": "^7.2.2",
     "uuid": "^14.0.1",
     "winston": "^3.19.0"
   },
   "devDependencies": {
-    "nodemon": "^3.1.14"
+    "nodemon": "^3.1.14",
+    "jest": "^30.4.2",
+    "supertest": "^7.2.2"
   }
 }

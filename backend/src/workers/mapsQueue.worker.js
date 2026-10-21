@@ -1,3 +1,4 @@
+const { lazyResource } = require('../config/resources');
 const { EventEmitter } = require('events');
 EventEmitter.defaultMaxListeners = 20;
 
@@ -8,7 +9,7 @@ const logger = require('../utils/logger');
 
 const connection = getBullMQConnection();
 
-const mapsQueue = new Queue('maps-requests', {
+const mapsQueue = lazyResource(() => new Queue('maps-requests', {
   connection,
   defaultJobOptions: {
     attempts: 3,
@@ -16,9 +17,9 @@ const mapsQueue = new Queue('maps-requests', {
     removeOnComplete: 100,
     removeOnFail: 50,
   },
-});
+}));
 
-const mapsQueueEvents = new QueueEvents('maps-requests', { connection });
+const mapsQueueEvents = lazyResource(() => new QueueEvents('maps-requests', { connection }));
 
 const CACHE_TTL = 300; // 5 minutes
 
@@ -35,6 +36,9 @@ async function getQueuedETA(fromLat, fromLng, toLat, toLng) {
     return parseInt(cached);
   }
 
+  // Start listening before a fast local worker can complete the job.
+  await mapsQueueEvents.waitUntilReady();
+
   // Add to queue
   const job = await mapsQueue.add(
     'get-eta',
@@ -48,37 +52,41 @@ async function getQueuedETA(fromLat, fromLng, toLat, toLng) {
 }
 
 // Worker — max 5 concurrent Maps API requests
-const worker = new Worker(
-  'maps-requests',
-  async (job) => {
-    const { fromLat, fromLng, toLat, toLng, cacheKey } = job.data;
+let worker;
+function startMapsWorker() {
+  if (worker) return worker;
+  worker = lazyResource(() => new Worker(
+    'maps-requests',
+    async (job) => {
+      const { fromLat, fromLng, toLat, toLng, cacheKey } = job.data;
 
-    // Check cache again (might be populated while in queue)
-    const cached = await redis.get(cacheKey);
-    if (cached) return parseInt(cached);
+      // Check cache again (might be populated while in queue)
+      const cached = await redis.get(cacheKey);
+      if (cached) return parseInt(cached);
 
-    const { getSingleETA } = require('../services/mapsService');
-    const etaMinutes = await getSingleETA(fromLat, fromLng, toLat, toLng);
+      const { getSingleETA } = require('../services/mapsService');
+      const etaMinutes = await getSingleETA(fromLat, fromLng, toLat, toLng);
 
-    await redis.set(cacheKey, etaMinutes.toString(), 'EX', CACHE_TTL);
-    logger.debug(`Maps API: ${etaMinutes}min | cached ${CACHE_TTL}s`);
+      await redis.set(cacheKey, etaMinutes.toString(), 'EX', CACHE_TTL);
+      logger.debug(`Maps API: ${etaMinutes}min | cached ${CACHE_TTL}s`);
 
-    return etaMinutes;
-  },
-  {
-    connection,
-    concurrency: 5,
-  }
-);
+      return etaMinutes;
+    },
+    {
+      connection,
+      concurrency: 5,
+    }
+  ));
 
-worker.on('failed', (job, err) => {
-  logger.error(`Maps queue job failed: ${job?.id}`, err.message);
-});
+  worker.on('failed', (job, err) => {
+    logger.error(`Maps queue job failed: ${job?.id}`, err.message);
+  });
 
-worker.on('error', (err) => {
-  logger.error(`Maps worker error: ${err.message}`);
-});
+  worker.on('error', (err) => {
+    logger.error(`Maps worker error: ${err.message}`);
+  });
 
-logger.info('Maps queue worker initialized');
+  return worker;
+}
 
-module.exports = { getQueuedETA, mapsQueue };
+module.exports = { startMapsWorker, getQueuedETA, mapsQueue };

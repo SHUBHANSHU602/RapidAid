@@ -1,3 +1,4 @@
+const { lazyResource } = require('../config/resources');
 const { EventEmitter } = require('events');
 EventEmitter.defaultMaxListeners = 20;
 
@@ -8,10 +9,9 @@ const EmergencySession = require('../models/EmergencySession');
 const logger = require('../utils/logger');
 
 const connection = getBullMQConnection();
-const delayQueue = new Queue('delay-detection', { connection });
-const queueEvents = new QueueEvents('delay-detection', { connection });
+const delayQueue = lazyResource(() => new Queue('delay-detection', { connection }));
+const queueEvents = lazyResource(() => new QueueEvents('delay-detection', { connection }));
 
-queueEvents.on('failed', ({ jobId, failedReason }) => logger.error(`Delay job failed: ${jobId} | ${failedReason}`));
 
 function getStallThresholdSeconds() {
   if (process.env.STALL_THRESHOLD_SECONDS) return Number(process.env.STALL_THRESHOLD_SECONDS);
@@ -71,60 +71,66 @@ async function cancelDelayDetection(sessionId) {
   }
 }
 
-const worker = new Worker(
-  'delay-detection',
-  async (job) => {
-    const { sessionId, initialEtaMinutes } = job.data;
-    const session = await EmergencySession.findById(sessionId).lean();
+let worker;
+function startDelayWorker() {
+  if (worker) return worker;
+  queueEvents.on('failed', ({ jobId, failedReason }) => logger.error(`Delay job failed: ${jobId} | ${failedReason}`));
+  worker = lazyResource(() => new Worker(
+    'delay-detection',
+    async (job) => {
+      const { sessionId, initialEtaMinutes } = job.data;
+      const session = await EmergencySession.findById(sessionId).lean();
 
-    if (!session || ['RESOLVED', 'CANCELLED'].includes(session?.status)) {
-      await cancelDelayDetection(sessionId);
-      return;
-    }
-    if (!session.ambulanceId || !['ASSIGNED', 'EN_ROUTE', 'DELAYED'].includes(session.status)) return;
-
-    const [etaRaw, lastMovementRaw] = await Promise.all([
-      redis.get(`session:${sessionId}:eta`),
-      redis.get(`session:${sessionId}:last_movement_at`),
-    ]);
-
-    let currentEta = Number(initialEtaMinutes) || 5;
-    if (etaRaw) {
-      try {
-        const parsed = JSON.parse(etaRaw);
-        if (Number(parsed.etaMinutes) > 0) currentEta = Number(parsed.etaMinutes);
-      } catch {
-        // Keep scheduler baseline if the cached ETA is malformed.
+      if (!session || ['RESOLVED', 'CANCELLED'].includes(session?.status)) {
+        await cancelDelayDetection(sessionId);
+        return;
       }
-    }
+      if (!session.ambulanceId || !['ASSIGNED', 'EN_ROUTE', 'DELAYED'].includes(session.status)) return;
 
-    const drift = currentEta - Number(initialEtaMinutes || 0);
-    const stalledSeconds = lastMovementRaw ? Math.floor((Date.now() - Number(lastMovementRaw)) / 1000) : 0;
-    const stallThreshold = getStallThresholdSeconds();
+      const [etaRaw, lastMovementRaw] = await Promise.all([
+        redis.get(`session:${sessionId}:eta`),
+        redis.get(`session:${sessionId}:last_movement_at`),
+      ]);
 
-    const delayedByEta = drift > 3;
-    // A DELAYED trip must keep being evaluated so reroute can later escalate to swap.
-    const delayedByStall = ['EN_ROUTE', 'DELAYED'].includes(session.status) && stalledSeconds >= stallThreshold;
+      let currentEta = Number(initialEtaMinutes) || 5;
+      if (etaRaw) {
+        try {
+          const parsed = JSON.parse(etaRaw);
+          if (Number(parsed.etaMinutes) > 0) currentEta = Number(parsed.etaMinutes);
+        } catch {
+          // Keep scheduler baseline if the cached ETA is malformed.
+        }
+      }
 
-    logger.debug(
-      `Delay check session=${sessionId} status=${session.status} eta=${currentEta} drift=${drift.toFixed(1)} stalled=${stalledSeconds}s`
-    );
+      const drift = currentEta - Number(initialEtaMinutes || 0);
+      const stalledSeconds = lastMovementRaw ? Math.floor((Date.now() - Number(lastMovementRaw)) / 1000) : 0;
+      const stallThreshold = getStallThresholdSeconds();
 
-    if (delayedByEta || delayedByStall) {
-      await handleDelay(sessionId, {
-        drift,
-        initialEtaMinutes,
-        currentEta,
-        stalledSeconds,
-        reason: delayedByStall ? 'AMBULANCE_STALLED' : 'ETA_DRIFT',
-      });
-    }
-  },
-  { connection, concurrency: 5 }
-);
+      const delayedByEta = drift > 3;
+      // A DELAYED trip must keep being evaluated so reroute can later escalate to swap.
+      const delayedByStall = ['EN_ROUTE', 'DELAYED'].includes(session.status) && stalledSeconds >= stallThreshold;
 
-worker.on('failed', (job, err) => logger.error(`Delay worker job failed: ${job?.id} | ${err.message}`));
-worker.on('error', (err) => logger.error(`Delay worker error: ${err.message}`));
+      logger.debug(
+        `Delay check session=${sessionId} status=${session.status} eta=${currentEta} drift=${drift.toFixed(1)} stalled=${stalledSeconds}s`
+      );
+
+      if (delayedByEta || delayedByStall) {
+        await handleDelay(sessionId, {
+          drift,
+          initialEtaMinutes,
+          currentEta,
+          stalledSeconds,
+          reason: delayedByStall ? 'AMBULANCE_STALLED' : 'ETA_DRIFT',
+        });
+      }
+    },
+    { connection, concurrency: 5 }
+  ));
+
+  worker.on('failed', (job, err) => logger.error(`Delay worker job failed: ${job?.id} | ${err.message}`));
+  worker.on('error', (err) => logger.error(`Delay worker error: ${err.message}`));
+  return worker;
+}
 
 async function handleDelay(sessionId, data) {
   const session = await EmergencySession.findById(sessionId);
@@ -178,6 +184,5 @@ async function handleDelay(sessionId, data) {
   );
 }
 
-logger.info('Delay detection worker initialized');
 
-module.exports = { delayQueue, scheduleDelayDetection, cancelDelayDetection };
+module.exports = { startDelayWorker, delayQueue, scheduleDelayDetection, cancelDelayDetection };

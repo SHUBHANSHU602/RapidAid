@@ -65,6 +65,7 @@ describe('Assignment: simultaneous patients competing for one ambulance', () => 
     expect(String(persistentAmbulance.assignedSessionId)).toBe(String(docs.find(s => s.status === 'ASSIGNED')._id));
     expect(await redis.get(`ambulance:${ambulance._id}:status`)).toBe('BUSY');
     await expect(updateAmbulanceStatus(ambulance._id, 'AVAILABLE')).rejects.toThrow('still has an assigned session');
+    expect(await redis.get(`ambulance:${ambulance._id}:status`)).toBe('BUSY');
     expect(await redis.sismember('ambulance:available', ambulance._id.toString())).toBe(0);
   });
   test('reconciler restores BUSY in Redis for a durably assigned ambulance', async () => {
